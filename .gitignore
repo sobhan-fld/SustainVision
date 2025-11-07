@@ -5,3 +5,5 @@ databases/*
 !databases/.gitkeep
 sustainvision/__pycache__/
 sustainvision/*.pyc
+emissions.csv
+training_report.csv

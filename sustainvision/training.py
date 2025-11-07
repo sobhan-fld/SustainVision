@@ -20,25 +20,26 @@ import csv
 import random
 import time
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import TrainingConfig
+from .data import DatasetPreparationError, build_classification_dataloaders
 
 
 try:  # Optional imports handled gracefully in `_ensure_dependencies`
     import torch
     from torch import nn
-    from torch.utils.data import DataLoader, TensorDataset
     from torch.cuda import amp
     import torch.nn.functional as F
+    from torchvision import models as tv_models
 except Exception:  # pragma: no cover - handled at runtime
     torch = None  # type: ignore
     nn = None  # type: ignore
-    DataLoader = None  # type: ignore
-    TensorDataset = None  # type: ignore
     amp = None  # type: ignore
     F = None  # type: ignore
+    tv_models = None  # type: ignore
 
 try:
     from codecarbon import EmissionsTracker
@@ -89,7 +90,7 @@ class MissingDependencyError(RuntimeError):
 def _ensure_dependencies() -> None:
     """Ensure that PyTorch and CodeCarbon are available before training."""
 
-    if torch is None or nn is None or DataLoader is None:
+    if torch is None or nn is None:
         raise MissingDependencyError(
             "PyTorch is required for training. Install it or adjust the "
             "training implementation to match your stack."
@@ -132,59 +133,6 @@ def _resolve_device(preferred: str) -> "torch.device":  # type: ignore[name-defi
     except Exception:
         print(f"[warn] Device '{preferred}' unavailable. Using CPU instead.")
         return torch.device("cpu")
-
-
-def _prepare_synthetic_dataset(
-    *,
-    num_samples: int = 2000,
-    input_dim: int = 32,
-    num_classes: int = 4,
-) -> "Tuple[TensorDataset, TensorDataset]":  # type: ignore[name-defined]
-    """Create a reproducible synthetic classification dataset."""
-
-    assert torch is not None and TensorDataset is not None
-    generator = torch.Generator().manual_seed(torch.initial_seed())
-    features = torch.randn(num_samples, input_dim, generator=generator)
-
-    # Construct deterministic labels by applying a fixed linear transform
-    weights = torch.randn(input_dim, num_classes, generator=generator)
-    logits = features @ weights
-    targets = torch.argmax(logits, dim=1)
-
-    split_idx = int(num_samples * 0.8)
-    train_ds = TensorDataset(features[:split_idx], targets[:split_idx])
-    val_ds = TensorDataset(features[split_idx:], targets[split_idx:])
-    return train_ds, val_ds
-
-
-class SimpleClassifier(nn.Module):  # type: ignore[name-defined]
-    """Small MLP classifier with projection head for contrastive losses."""
-
-    def __init__(self, input_dim: int, num_classes: int) -> None:
-        super().__init__()
-        hidden_dim = 256
-        projection_dim = 64
-
-        self.backbone = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-        )
-        self.classifier = nn.Linear(hidden_dim // 2, num_classes)
-        self.projection = nn.Sequential(
-            nn.Linear(hidden_dim // 2, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, projection_dim),
-        )
-
-    def forward(self, x: "torch.Tensor") -> Tuple["torch.Tensor", "torch.Tensor"]:  # type: ignore[name-defined]
-        features = self.backbone(x)
-        logits = self.classifier(features)
-        embeddings = F.normalize(self.projection(features), dim=1) if F is not None else features
-        return logits, embeddings
-
-
 def _unique_report_path(base_dir: Path, desired_name: str) -> Path:
     """Return a unique path for the report file, avoiding overwrites."""
 
@@ -220,7 +168,7 @@ def train_model(
     """
 
     _ensure_dependencies()
-    assert torch is not None and nn is not None and DataLoader is not None
+    assert torch is not None and nn is not None
 
     _set_seed(config.seed)
 
@@ -234,18 +182,35 @@ def train_model(
     learning_rate = float(config.hyperparameters.get("lr", 1e-3))
     epochs = int(config.hyperparameters.get("epochs", 3))
     momentum = float(config.hyperparameters.get("momentum", 0.9))
-
     temperature = float(config.hyperparameters.get("temperature", 0.1))
-
-    train_ds, val_ds = _prepare_synthetic_dataset()
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size)
-
-    input_dim = train_ds.tensors[0].shape[1]
-    num_classes = len(torch.unique(train_ds.tensors[1]))
-    model = SimpleClassifier(input_dim=input_dim, num_classes=num_classes).to(device)
+    num_workers = int(config.hyperparameters.get("num_workers", 2))
+    val_split = float(config.hyperparameters.get("val_split", 0.1))
+    image_size = int(config.hyperparameters.get("image_size", 224))
+    projection_dim = int(config.hyperparameters.get("projection_dim", 128))
 
     loss_spec = _build_loss(config.loss_function)
+    contrastive_mode = loss_spec.mode != "logits"
+
+    try:
+        train_loader, val_loader, num_classes = build_classification_dataloaders(
+            config.database,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            val_split=val_split,
+            seed=config.seed,
+            project_root=project_dir,
+            image_size=image_size,
+            contrastive=contrastive_mode,
+        )
+    except DatasetPreparationError as exc:
+        raise MissingDependencyError(str(exc)) from exc
+
+    model = _build_model(
+        config.model,
+        num_classes=num_classes,
+        image_size=image_size,
+        projection_dim=projection_dim,
+    ).to(device)
     optimizer = _build_optimizer(
         config.optimizer,
         model.parameters(),
@@ -258,92 +223,135 @@ def train_model(
     use_amp = bool(config.mixed_precision) and device.type == "cuda" and amp is not None
     scaler = amp.GradScaler(enabled=use_amp) if amp is not None else None
 
+    logging.getLogger("codecarbon").setLevel(logging.WARNING)
     tracker = EmissionsTracker(
-        measure_power_secs=1,
+        measure_power_secs=5,
         project_name=report_path.stem,
+        log_level="warning",
     )  # type: ignore[call-arg]
     tracker.start()
 
     epoch_metrics: List[EpochMetrics] = []
+    emissions_kg: Optional[float] = None
+    emissions_data: Any = None
 
     start_time = time.perf_counter()
-    for epoch in range(1, epochs + 1):
-        model.train()
-        epoch_loss = 0.0
-        correct = 0
-        total = 0
 
-        for inputs, labels in train_loader:
-            inputs = inputs.to(device)
-            labels = labels.to(device)
+    try:
+        epoch_iterable = range(1, epochs + 1)
+        use_tqdm = False
+        try:
+            from tqdm.auto import tqdm
+            epoch_iterable = tqdm(epoch_iterable, desc="Epochs", unit="epoch")
+            use_tqdm = True
+        except Exception:
+            print("[warn] tqdm is not installed. Using range instead.")
+            pass
 
-            optimizer.zero_grad()
+        for epoch in epoch_iterable:
+            model.train()
+            epoch_loss = 0.0
+            correct = 0
+            total = 0
 
-            if use_amp and scaler is not None:
-                with amp.autocast():  # type: ignore[attr-defined]
-                    logits, embeddings = model(inputs)
-                    loss = _compute_loss(loss_spec, logits, embeddings, labels, temperature)
-                scaler.scale(loss).backward()
-                if config.gradient_clip_norm is not None:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                logits, embeddings = model(inputs)
-                loss = _compute_loss(loss_spec, logits, embeddings, labels, temperature)
-                loss.backward()
-                if config.gradient_clip_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
-                optimizer.step()
+            batch_iterable = train_loader
+            if use_tqdm:
+                from tqdm.auto import tqdm  # type: ignore
 
-            epoch_loss += loss.item() * inputs.size(0)
-            preds = logits.argmax(dim=1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
+                batch_iterable = tqdm(
+                    train_loader,
+                    desc=f"Train {epoch:02d}/{epochs}",
+                    leave=False,
+                    unit="batch",
+                )
 
-        train_loss = epoch_loss / total
-        train_acc = correct / total if total else 0.0
-
-        model.eval()
-        val_loss_accum = 0.0
-        val_correct = 0
-        val_total = 0
-        with torch.no_grad():
-            for inputs, labels in val_loader:
+            for inputs, labels in batch_iterable:
                 inputs = inputs.to(device)
                 labels = labels.to(device)
-                logits, embeddings = model(inputs)
-                loss = _compute_loss(loss_spec, logits, embeddings, labels, temperature)
-                val_loss_accum += loss.item() * inputs.size(0)
+
+                optimizer.zero_grad()
+
+                if use_amp and scaler is not None:
+                    with amp.autocast():  # type: ignore[attr-defined]
+                        logits, embeddings = model(inputs)
+                        loss = _compute_loss(loss_spec, logits, embeddings, labels, temperature)
+                    scaler.scale(loss).backward()
+                    if config.gradient_clip_norm is not None:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    logits, embeddings = model(inputs)
+                    loss = _compute_loss(loss_spec, logits, embeddings, labels, temperature)
+                    loss.backward()
+                    if config.gradient_clip_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
+                    optimizer.step()
+
+                epoch_loss += loss.item() * inputs.size(0)
                 preds = logits.argmax(dim=1)
-                val_correct += (preds == labels).sum().item()
-                val_total += labels.size(0)
+                correct += (preds == labels).sum().item()
+                total += labels.size(0)
 
-        val_loss = val_loss_accum / val_total if val_total else 0.0
-        val_acc = val_correct / val_total if val_total else 0.0
+            if use_tqdm:
+                try:
+                    batch_iterable.close()  # type: ignore[attr-defined]
+                except Exception:
+                    pass
 
-        epoch_metrics.append(
-            EpochMetrics(
-                epoch=epoch,
-                train_loss=train_loss,
-                train_accuracy=train_acc,
-                val_loss=val_loss,
-                val_accuracy=val_acc,
+            train_loss = epoch_loss / total
+            train_acc = correct / total if total else 0.0
+
+            model.eval()
+            val_loss_accum = 0.0
+            val_correct = 0
+            val_total = 0
+            with torch.no_grad():
+                for inputs, labels in val_loader:
+                    inputs = inputs.to(device)
+                    labels = labels.to(device)
+                    logits, embeddings = model(inputs)
+                    loss = _compute_loss(loss_spec, logits, embeddings, labels, temperature)
+                    val_loss_accum += loss.item() * inputs.size(0)
+                    preds = logits.argmax(dim=1)
+                    val_correct += (preds == labels).sum().item()
+                    val_total += labels.size(0)
+
+            val_loss = val_loss_accum / val_total if val_total else 0.0
+            val_acc = val_correct / val_total if val_total else 0.0
+
+            epoch_metrics.append(
+                EpochMetrics(
+                    epoch=epoch,
+                    train_loss=train_loss,
+                    train_accuracy=train_acc,
+                    val_loss=val_loss,
+                    val_accuracy=val_acc,
+                )
             )
-        )
 
-        print(
-            f"Epoch {epoch:02d}/{epochs} - "
-            f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
-            f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
-        )
+            message = (
+                f"Epoch {epoch:02d}/{epochs} - "
+                f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
+                f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
+            )
+            if use_tqdm and hasattr(epoch_iterable, "write"):
+                epoch_iterable.write(message)
+            else:
+                print(message)
 
-        if scheduler is not None:
-            scheduler.step()
+            if scheduler is not None:
+                scheduler.step()
+        if use_tqdm and hasattr(epoch_iterable, "close"):
+            epoch_iterable.close()
 
-    emissions_kg = tracker.stop()
-    emissions_data = getattr(tracker, "final_emissions_data", None)
+        emissions_kg = tracker.stop()
+        emissions_data = getattr(tracker, "final_emissions_data", None)
+    finally:
+        if emissions_kg is None:
+            emissions_kg = tracker.stop()
+            emissions_data = getattr(tracker, "final_emissions_data", None)
 
     duration = time.perf_counter() - start_time
     energy_kwh = None
@@ -464,7 +472,8 @@ def _build_loss(name: str) -> LossSpec:
         "binary_cross_entropy": nn.BCEWithLogitsLoss,
     }
     if key in mapping:
-        return LossSpec(name=key, mode="logits", criterion=mapping[key]())
+        mode = "bce" if key == "binary_cross_entropy" else "logits"
+        return LossSpec(name=key, mode=mode, criterion=mapping[key]())
     if key == "simclr":
         return LossSpec(name=key, mode="simclr")
     if key in {"supcon", "supervised_contrastive"}:
@@ -542,6 +551,19 @@ def _compute_loss(
     if spec.mode == "logits":
         assert spec.criterion is not None
         return spec.criterion(logits, labels)
+    if spec.mode == "bce":
+        assert spec.criterion is not None
+        target = labels
+        if target.shape != logits.shape:
+            if target.dim() == 1 and logits.dim() == 2:
+                num_classes = logits.size(1)
+                target = F.one_hot(target.long(), num_classes=num_classes)
+                target = target.to(dtype=logits.dtype)
+            else:
+                target = target.to(dtype=logits.dtype).view_as(logits)
+        else:
+            target = target.to(dtype=logits.dtype)
+        return spec.criterion(logits, target)
     if spec.mode == "simclr":
         return _simclr_loss(embeddings, temperature)
     if spec.mode == "supcon":
@@ -606,3 +628,99 @@ def _supcon_loss(
     return loss.mean()
 
 
+class ProjectionModel(nn.Module):  # type: ignore[name-defined]
+    """Wrap a backbone with classification and projection heads."""
+
+    def __init__(
+        self,
+        backbone: nn.Module,
+        feature_dim: int,
+        num_classes: int,
+        projection_dim: int,
+    ) -> None:
+        super().__init__()
+        self.backbone = backbone
+        self.classifier = nn.Linear(feature_dim, num_classes)
+        self.projector = nn.Sequential(
+            nn.Linear(feature_dim, max(feature_dim, projection_dim)),
+            nn.ReLU(),
+            nn.Linear(max(feature_dim, projection_dim), projection_dim),
+        )
+
+    def forward(self, x: "torch.Tensor") -> Tuple["torch.Tensor", "torch.Tensor"]:  # type: ignore[name-defined]
+        features = self.backbone(x)
+        if isinstance(features, tuple):
+            features = features[0]
+        if features.ndim > 2:
+            features = torch.flatten(features, 1)
+        logits = self.classifier(features)
+        embeddings = F.normalize(self.projector(features), dim=1) if F is not None else features
+        return logits, embeddings
+
+
+def _build_linear_model(
+    num_classes: int,
+    image_size: int,
+    projection_dim: int,
+) -> ProjectionModel:
+    in_features = image_size * image_size * 3
+    feature_dim = 512
+    backbone = nn.Sequential(
+        nn.Flatten(),
+        nn.Linear(in_features, 1024),
+        nn.ReLU(),
+        nn.Linear(1024, feature_dim),
+        nn.ReLU(),
+    )
+    return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+
+
+def _build_model(
+    name: str,
+    *,
+    num_classes: int,
+    image_size: int,
+    projection_dim: int,
+) -> nn.Module:
+    key = (name or "resnet18").lower()
+
+    if tv_models is None:
+        print("[warn] torchvision models unavailable. Using simple MLP classifier.")
+        return _build_linear_model(num_classes, image_size, projection_dim)
+
+    try:
+        if key == "resnet18":
+            backbone = tv_models.resnet18(weights=None)
+            feature_dim = backbone.fc.in_features
+            backbone.fc = nn.Identity()
+            return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+        if key == "resnet34":
+            backbone = tv_models.resnet34(weights=None)
+            feature_dim = backbone.fc.in_features
+            backbone.fc = nn.Identity()
+            return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+        if key == "resnet50":
+            backbone = tv_models.resnet50(weights=None)
+            feature_dim = backbone.fc.in_features
+            backbone.fc = nn.Identity()
+            return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+        if key == "mobilenet_v3_small":
+            backbone = tv_models.mobilenet_v3_small(weights=None)
+            feature_dim = backbone.classifier[-1].in_features
+            backbone.classifier[-1] = nn.Identity()
+            return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+        if key == "efficientnet_b0":
+            backbone = tv_models.efficientnet_b0(weights=None)
+            feature_dim = backbone.classifier[-1].in_features
+            backbone.classifier[-1] = nn.Identity()
+            return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+        if key in {"vit_b_16", "vit-b-16", "vit"}:
+            backbone = tv_models.vit_b_16(weights=None)
+            feature_dim = backbone.heads.head.in_features
+            backbone.heads.head = nn.Identity()
+            return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+    except Exception as exc:  # pragma: no cover - model construction safeguard
+        print(f"[warn] Failed to build model '{name}': {exc}. Falling back to MLP classifier.")
+
+    print(f"[warn] Unsupported model '{name}'. Using simple MLP classifier instead.")
+    return _build_linear_model(num_classes, image_size, projection_dim)

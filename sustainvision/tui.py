@@ -65,6 +65,26 @@ def _ask_hyperparameters(hp: Dict[str, Any]) -> Dict[str, Any]:
     lr = questionary.text("learning rate:", default=str(hp.get("lr", 1e-3))).ask()
     epochs = questionary.text("epochs:", default=str(hp.get("epochs", 3))).ask()
     momentum = questionary.text("momentum (SGD-based optimizers):", default=str(hp.get("momentum", 0.9))).ask()
+    temperature = questionary.text(
+        "contrastive temperature:",
+        default=str(hp.get("temperature", 0.1)),
+    ).ask()
+    num_workers = questionary.text(
+        "dataloader workers:",
+        default=str(hp.get("num_workers", 2)),
+    ).ask()
+    val_split = questionary.text(
+        "validation split (0-1):",
+        default=str(hp.get("val_split", 0.1)),
+    ).ask()
+    image_size = questionary.text(
+        "input image size:",
+        default=str(hp.get("image_size", 224)),
+    ).ask()
+    projection_dim = questionary.text(
+        "projection head dimension:",
+        default=str(hp.get("projection_dim", 128)),
+    ).ask()
 
     def as_int(value: str, default: int) -> int:
         try:
@@ -83,6 +103,11 @@ def _ask_hyperparameters(hp: Dict[str, Any]) -> Dict[str, Any]:
         "lr": as_float(lr, hp.get("lr", 1e-3)),
         "epochs": as_int(epochs, hp.get("epochs", 3)),
         "momentum": as_float(momentum, hp.get("momentum", 0.9)),
+        "temperature": as_float(temperature, hp.get("temperature", 0.1)),
+        "num_workers": as_int(num_workers, hp.get("num_workers", 2)),
+        "val_split": as_float(val_split, hp.get("val_split", 0.1)),
+        "image_size": as_int(image_size, hp.get("image_size", 224)),
+        "projection_dim": as_int(projection_dim, hp.get("projection_dim", 128)),
     }
 
 

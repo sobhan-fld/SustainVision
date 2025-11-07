@@ -92,6 +92,10 @@ class TrainingConfig:
             "epochs": 3,
             "momentum": 0.9,
             "temperature": 0.1,
+            "num_workers": 2,
+            "val_split": 0.1,
+            "image_size": 224,
+            "projection_dim": 128,
         }
     )
 

@@ -20,6 +20,8 @@ Key Capabilities
 - Automatic discovery of available devices (CPU and CUDA indices when PyTorch is installed)
 - Built-in reference training loop (PyTorch) wrapped with CodeCarbon emissions tracking
 - CSV reporting pipeline capturing per-epoch metrics plus sustainability summary
+- Real training loop leveraging torchvision backbones (ResNet, MobileNet,
+  EfficientNet, ViT) with configurable datasets and CodeCarbon logging
 - Advanced training controls: optimizer/loss selection (Cross-Entropy, SimCLR,
   SupCon, etc.), weight decay, schedulers, AMP toggle, gradient clipping, and
   reproducibility seed management
@@ -79,8 +81,11 @@ Training Workflow & Output
 --------------------------
 
 - The sample training loop creates a synthetic classification dataset and trains a
-  small neural network for the requested number of epochs. Replace it with your
-  production training code when ready.
+- The training loop now consumes real datasets (CIFAR10, MNIST, or custom
+  `ImageFolder` layouts) and trains torchvision backbones with projection heads.
+- Contrastive objectives (SimCLR / SupCon) use strengthened augmentations and
+  normalized projections, while Cross-Entropy-based losses follow standard
+  classification.
 - CodeCarbon wraps the full run and reports total energy usage and CO₂e emissions.
 - Metrics and sustainability data are written to a CSV file in the project root.
   - The file name comes from `report_filename` in the config (default
@@ -123,6 +128,10 @@ Configuration Reference
   - `epochs`
   - `momentum`
   - `temperature`
+  - `num_workers`
+  - `val_split`
+  - `image_size`
+  - `projection_dim`
 
 Dataset Storage
 ---------------
