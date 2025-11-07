@@ -91,6 +91,7 @@ class TrainingConfig:
             "lr": 1e-3,
             "epochs": 3,
             "momentum": 0.9,
+            "temperature": 0.1,
         }
     )
 

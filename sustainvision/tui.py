@@ -107,7 +107,16 @@ def _ask_optimizer(current: str) -> str:
 
 
 def _ask_loss_function(current: str) -> str:
-    options = ["cross_entropy", "mse", "l1", "smooth_l1", "binary_cross_entropy", "custom"]
+    options = [
+        "cross_entropy",
+        "mse",
+        "l1",
+        "smooth_l1",
+        "binary_cross_entropy",
+        "simclr",
+        "supcon",
+        "custom",
+    ]
     choice = questionary.select(
         "Loss function:",
         choices=options,

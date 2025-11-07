@@ -20,8 +20,9 @@ Key Capabilities
 - Automatic discovery of available devices (CPU and CUDA indices when PyTorch is installed)
 - Built-in reference training loop (PyTorch) wrapped with CodeCarbon emissions tracking
 - CSV reporting pipeline capturing per-epoch metrics plus sustainability summary
-- Advanced training controls: optimizer/loss selection, weight decay, schedulers,
-  AMP toggle, gradient clipping, and reproducibility seed management
+- Advanced training controls: optimizer/loss selection (Cross-Entropy, SimCLR,
+  SupCon, etc.), weight decay, schedulers, AMP toggle, gradient clipping, and
+  reproducibility seed management
 - Dataset download helper that stores assets under `databases/` (ignored by git)
 
 Planned Enhancements
@@ -111,7 +112,7 @@ Configuration Reference
 - `report_filename`: Desired CSV filename for training metrics & emissions summary
 - `seed`: Random seed applied to Python, NumPy, and PyTorch
 - `optimizer`: Optimizer name (`adam`, `sgd`, `adamw`, `rmsprop`, `lion`, ...)
-- `loss_function`: Loss function (`cross_entropy`, `mse`, `bce`, ...)
+- `loss_function`: Loss function (`cross_entropy`, `mse`, `bce`, `simclr`, `supcon`, ...)
 - `weight_decay`: L2 regularization strength
 - `scheduler`: Learning rate scheduler descriptor (`type` + `params`)
 - `gradient_clip_norm`: Optional gradient clipping threshold
@@ -121,6 +122,7 @@ Configuration Reference
   - `lr`
   - `epochs`
   - `momentum`
+  - `temperature`
 
 Dataset Storage
 ---------------
@@ -155,5 +157,4 @@ License
 -------
 
 Please add a license file to clarify usage (MIT, Apache 2.0, etc.).
-
 

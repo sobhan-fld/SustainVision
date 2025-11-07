@@ -31,12 +31,14 @@ try:  # Optional imports handled gracefully in `_ensure_dependencies`
     from torch import nn
     from torch.utils.data import DataLoader, TensorDataset
     from torch.cuda import amp
+    import torch.nn.functional as F
 except Exception:  # pragma: no cover - handled at runtime
     torch = None  # type: ignore
     nn = None  # type: ignore
     DataLoader = None  # type: ignore
     TensorDataset = None  # type: ignore
     amp = None  # type: ignore
+    F = None  # type: ignore
 
 try:
     from codecarbon import EmissionsTracker
@@ -69,6 +71,15 @@ class TrainingRunSummary:
     energy_kwh: Optional[float]
     duration_seconds: Optional[float]
     epochs: List[EpochMetrics]
+
+
+@dataclass
+class LossSpec:
+    """Description of the selected loss function."""
+
+    name: str
+    mode: str  # 'logits', 'simclr', 'supcon'
+    criterion: Optional[Any] = None
 
 
 class MissingDependencyError(RuntimeError):
@@ -146,6 +157,34 @@ def _prepare_synthetic_dataset(
     return train_ds, val_ds
 
 
+class SimpleClassifier(nn.Module):  # type: ignore[name-defined]
+    """Small MLP classifier with projection head for contrastive losses."""
+
+    def __init__(self, input_dim: int, num_classes: int) -> None:
+        super().__init__()
+        hidden_dim = 256
+        projection_dim = 64
+
+        self.backbone = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+        )
+        self.classifier = nn.Linear(hidden_dim // 2, num_classes)
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_dim // 2, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dim // 2, projection_dim),
+        )
+
+    def forward(self, x: "torch.Tensor") -> Tuple["torch.Tensor", "torch.Tensor"]:  # type: ignore[name-defined]
+        features = self.backbone(x)
+        logits = self.classifier(features)
+        embeddings = F.normalize(self.projection(features), dim=1) if F is not None else features
+        return logits, embeddings
+
+
 def _unique_report_path(base_dir: Path, desired_name: str) -> Path:
     """Return a unique path for the report file, avoiding overwrites."""
 
@@ -196,17 +235,17 @@ def train_model(
     epochs = int(config.hyperparameters.get("epochs", 3))
     momentum = float(config.hyperparameters.get("momentum", 0.9))
 
+    temperature = float(config.hyperparameters.get("temperature", 0.1))
+
     train_ds, val_ds = _prepare_synthetic_dataset()
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size)
 
-    model = nn.Sequential(
-        nn.Linear(train_ds.tensors[0].shape[1], 128),
-        nn.ReLU(),
-        nn.Linear(128, len(torch.unique(train_ds.tensors[1]))),
-    ).to(device)
+    input_dim = train_ds.tensors[0].shape[1]
+    num_classes = len(torch.unique(train_ds.tensors[1]))
+    model = SimpleClassifier(input_dim=input_dim, num_classes=num_classes).to(device)
 
-    criterion = _build_loss(config.loss_function)
+    loss_spec = _build_loss(config.loss_function)
     optimizer = _build_optimizer(
         config.optimizer,
         model.parameters(),
@@ -242,8 +281,8 @@ def train_model(
 
             if use_amp and scaler is not None:
                 with amp.autocast():  # type: ignore[attr-defined]
-                    outputs = model(inputs)
-                    loss = criterion(outputs, labels)
+                    logits, embeddings = model(inputs)
+                    loss = _compute_loss(loss_spec, logits, embeddings, labels, temperature)
                 scaler.scale(loss).backward()
                 if config.gradient_clip_norm is not None:
                     scaler.unscale_(optimizer)
@@ -251,15 +290,15 @@ def train_model(
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
+                logits, embeddings = model(inputs)
+                loss = _compute_loss(loss_spec, logits, embeddings, labels, temperature)
                 loss.backward()
                 if config.gradient_clip_norm is not None:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
                 optimizer.step()
 
             epoch_loss += loss.item() * inputs.size(0)
-            preds = outputs.argmax(dim=1)
+            preds = logits.argmax(dim=1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
 
@@ -274,10 +313,10 @@ def train_model(
             for inputs, labels in val_loader:
                 inputs = inputs.to(device)
                 labels = labels.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
+                logits, embeddings = model(inputs)
+                loss = _compute_loss(loss_spec, logits, embeddings, labels, temperature)
                 val_loss_accum += loss.item() * inputs.size(0)
-                preds = outputs.argmax(dim=1)
+                preds = logits.argmax(dim=1)
                 val_correct += (preds == labels).sum().item()
                 val_total += labels.size(0)
 
@@ -361,6 +400,7 @@ def _write_report_csv(
         "weight_decay",
         "scheduler",
         "seed",
+        "temperature",
     ]
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -386,6 +426,7 @@ def _write_report_csv(
                     "weight_decay": config.weight_decay,
                     "scheduler": config.scheduler,
                     "seed": config.seed,
+                    "temperature": config.hyperparameters.get("temperature"),
                 }
             )
 
@@ -407,11 +448,12 @@ def _write_report_csv(
                 "weight_decay": config.weight_decay,
                 "scheduler": config.scheduler,
                 "seed": config.seed,
+                "temperature": config.hyperparameters.get("temperature"),
             }
         )
 
 
-def _build_loss(name: str) -> "nn.Module":  # type: ignore[name-defined]
+def _build_loss(name: str) -> LossSpec:
     assert nn is not None
     key = (name or "cross_entropy").lower()
     mapping = {
@@ -422,10 +464,13 @@ def _build_loss(name: str) -> "nn.Module":  # type: ignore[name-defined]
         "binary_cross_entropy": nn.BCEWithLogitsLoss,
     }
     if key in mapping:
-        return mapping[key]()
-    # Fallback to CrossEntropyLoss but warn the user
+        return LossSpec(name=key, mode="logits", criterion=mapping[key]())
+    if key == "simclr":
+        return LossSpec(name=key, mode="simclr")
+    if key in {"supcon", "supervised_contrastive"}:
+        return LossSpec(name="supcon", mode="supcon")
     print(f"[warn] Unsupported loss '{name}'. Falling back to CrossEntropyLoss.")
-    return nn.CrossEntropyLoss()
+    return LossSpec(name="cross_entropy", mode="logits", criterion=nn.CrossEntropyLoss())
 
 
 def _build_optimizer(
@@ -485,5 +530,79 @@ def _build_scheduler(config: Dict[str, Any], optimizer) -> Optional[Any]:
 
     print(f"[warn] Unsupported scheduler '{config.get('type')}'. Scheduler disabled.")
     return None
+
+
+def _compute_loss(
+    spec: LossSpec,
+    logits: "torch.Tensor",
+    embeddings: "torch.Tensor",
+    labels: "torch.Tensor",
+    temperature: float,
+) -> "torch.Tensor":  # type: ignore[name-defined]
+    if spec.mode == "logits":
+        assert spec.criterion is not None
+        return spec.criterion(logits, labels)
+    if spec.mode == "simclr":
+        return _simclr_loss(embeddings, temperature)
+    if spec.mode == "supcon":
+        return _supcon_loss(embeddings, labels, temperature)
+    # Fallback safety
+    assert spec.criterion is not None
+    return spec.criterion(logits, labels)
+
+
+def _simclr_loss(embeddings: "torch.Tensor", temperature: float) -> "torch.Tensor":  # type: ignore[name-defined]
+    batch_size = embeddings.size(0)
+    if batch_size < 2:
+        return embeddings.new_zeros(())
+
+    noise = torch.randn_like(embeddings) * 0.01
+    z1 = F.normalize(embeddings + noise, dim=1)
+    z2 = F.normalize(embeddings - noise, dim=1)
+    representations = torch.cat([z1, z2], dim=0)
+
+    logits = torch.matmul(representations, representations.T) / max(temperature, 1e-6)
+    mask = torch.eye(2 * batch_size, device=embeddings.device, dtype=torch.bool)
+    logits = logits.masked_fill(mask, -1e9)
+
+    targets = torch.arange(2 * batch_size, device=embeddings.device)
+    targets = (targets + batch_size) % (2 * batch_size)
+
+    return F.cross_entropy(logits, targets)
+
+
+def _supcon_loss(
+    embeddings: "torch.Tensor",
+    labels: "torch.Tensor",
+    temperature: float,
+) -> "torch.Tensor":  # type: ignore[name-defined]
+    device = embeddings.device
+    labels = labels.contiguous().view(-1, 1)
+    batch_size = embeddings.size(0)
+
+    if batch_size < 2:
+        return embeddings.new_zeros(())
+
+    mask = torch.eq(labels, labels.T).float().to(device)
+    anchor_dot_contrast = torch.div(
+        torch.matmul(embeddings, embeddings.T),
+        max(temperature, 1e-6),
+    )
+
+    # For numerical stability
+    logits_max, _ = anchor_dot_contrast.max(dim=1, keepdim=True)
+    logits = anchor_dot_contrast - logits_max.detach()
+
+    logits_mask = torch.ones_like(mask) - torch.eye(batch_size, device=device)
+    mask = mask * logits_mask
+
+    exp_logits = torch.exp(logits) * logits_mask
+    log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-12)
+
+    mask_sum = mask.sum(dim=1)
+    mean_log_prob_pos = (mask * log_prob).sum(dim=1) / torch.clamp(mask_sum, min=1.0)
+
+    loss = -temperature * mean_log_prob_pos
+    return loss.mean()
 
 
