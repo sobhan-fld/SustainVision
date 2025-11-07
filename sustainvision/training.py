@@ -211,6 +211,12 @@ def train_model(
         image_size=image_size,
         projection_dim=projection_dim,
     ).to(device)
+    try:
+        model_device = next(model.parameters()).device
+        print(f"[info] Training on device: {model_device}")
+    except StopIteration:
+        print("[info] Training on device: unknown (model has no parameters)")
+
     optimizer = _build_optimizer(
         config.optimizer,
         model.parameters(),

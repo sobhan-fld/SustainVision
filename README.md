@@ -133,6 +133,42 @@ Configuration Reference
   - `image_size`
   - `projection_dim`
 
+Available Options Cheat Sheet
+-----------------------------
+
+**Models**
+- `resnet18`, `resnet34`, `resnet50`
+- `mobilenet_v3_small`
+- `efficientnet_b0`
+- `vit_b_16`
+- Any custom model string (falls back to an MLP classifier if not recognized)
+
+**Loss Functions**
+- `cross_entropy` (single-label classification)
+- `binary_cross_entropy` (auto one-hot for multi-class)
+- `mse`, `l1`, `smooth_l1`
+- `simclr`, `supcon` (contrastive)
+
+**Optimizers**
+- `adam`, `adamw`, `sgd`, `rmsprop`, `lion`
+- Custom strings fall back to Adam
+
+**Schedulers**
+- `none` (default)
+- `step_lr` (`step_size`, `gamma`)
+- `cosine_annealing` (`t_max`, `eta_min`)
+- `exponential` (`gamma`)
+
+**Devices**
+- `cpu`, `cuda`, or `cuda:{index}`. On Colab/GPUs, set `device="cuda"` so the trainer stays on GPU.
+
+**Dataset Helpers**
+- `cifar10`, `mnist`, `synthetic`
+- Any ImageFolder layout (`train/`, `val/`, `test/` directories)
+
+**TUI Prompts**
+- Every prompt mirrors the config keys above; defaults are safe for CPU smoke tests (batch 32, 1 epoch, mobilenet, etc.).
+
 Dataset Storage
 ---------------
 
