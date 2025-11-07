@@ -17,10 +17,11 @@ that matches your project once you connect SustainVision to real workloads.
 from __future__ import annotations
 
 import csv
+import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .config import TrainingConfig
 
@@ -29,16 +30,23 @@ try:  # Optional imports handled gracefully in `_ensure_dependencies`
     import torch
     from torch import nn
     from torch.utils.data import DataLoader, TensorDataset
+    from torch.cuda import amp
 except Exception:  # pragma: no cover - handled at runtime
     torch = None  # type: ignore
     nn = None  # type: ignore
     DataLoader = None  # type: ignore
     TensorDataset = None  # type: ignore
+    amp = None  # type: ignore
 
 try:
     from codecarbon import EmissionsTracker
 except Exception:  # pragma: no cover - handled at runtime
     EmissionsTracker = None  # type: ignore
+
+try:
+    import numpy as np
+except Exception:  # pragma: no cover - runtime safeguard
+    np = None  # type: ignore
 
 
 @dataclass
@@ -82,6 +90,21 @@ def _ensure_dependencies() -> None:
         )
 
 
+def _set_seed(seed: int) -> None:
+    """Set random seeds for reproducibility."""
+
+    random.seed(seed)
+    if np is not None:
+        try:
+            np.random.seed(seed)
+        except Exception:
+            pass
+    if torch is not None:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+
 def _resolve_device(preferred: str) -> "torch.device":  # type: ignore[name-defined]
     """Resolve the requested device, falling back to CPU if unavailable."""
 
@@ -105,11 +128,11 @@ def _prepare_synthetic_dataset(
     num_samples: int = 2000,
     input_dim: int = 32,
     num_classes: int = 4,
-) -> "tuple[TensorDataset, TensorDataset]":  # type: ignore[name-defined]
+) -> "Tuple[TensorDataset, TensorDataset]":  # type: ignore[name-defined]
     """Create a reproducible synthetic classification dataset."""
 
     assert torch is not None and TensorDataset is not None
-    generator = torch.Generator().manual_seed(42)
+    generator = torch.Generator().manual_seed(torch.initial_seed())
     features = torch.randn(num_samples, input_dim, generator=generator)
 
     # Construct deterministic labels by applying a fixed linear transform
@@ -160,6 +183,8 @@ def train_model(
     _ensure_dependencies()
     assert torch is not None and nn is not None and DataLoader is not None
 
+    _set_seed(config.seed)
+
     project_dir = project_root or Path.cwd()
     project_dir.mkdir(parents=True, exist_ok=True)
     report_path = _unique_report_path(project_dir, config.report_filename)
@@ -169,6 +194,7 @@ def train_model(
     batch_size = int(config.hyperparameters.get("batch_size", 32))
     learning_rate = float(config.hyperparameters.get("lr", 1e-3))
     epochs = int(config.hyperparameters.get("epochs", 3))
+    momentum = float(config.hyperparameters.get("momentum", 0.9))
 
     train_ds, val_ds = _prepare_synthetic_dataset()
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
@@ -180,10 +206,23 @@ def train_model(
         nn.Linear(128, len(torch.unique(train_ds.tensors[1]))),
     ).to(device)
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    criterion = _build_loss(config.loss_function)
+    optimizer = _build_optimizer(
+        config.optimizer,
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=config.weight_decay,
+        momentum=momentum,
+    )
+    scheduler = _build_scheduler(config.scheduler, optimizer)
 
-    tracker = EmissionsTracker(measure_power_secs=1)  # type: ignore[call-arg]
+    use_amp = bool(config.mixed_precision) and device.type == "cuda" and amp is not None
+    scaler = amp.GradScaler(enabled=use_amp) if amp is not None else None
+
+    tracker = EmissionsTracker(
+        measure_power_secs=1,
+        project_name=report_path.stem,
+    )  # type: ignore[call-arg]
     tracker.start()
 
     epoch_metrics: List[EpochMetrics] = []
@@ -200,10 +239,24 @@ def train_model(
             labels = labels.to(device)
 
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+
+            if use_amp and scaler is not None:
+                with amp.autocast():  # type: ignore[attr-defined]
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
+                scaler.scale(loss).backward()
+                if config.gradient_clip_norm is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
+                loss.backward()
+                if config.gradient_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
+                optimizer.step()
 
             epoch_loss += loss.item() * inputs.size(0)
             preds = outputs.argmax(dim=1)
@@ -246,6 +299,9 @@ def train_model(
             f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
             f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
         )
+
+        if scheduler is not None:
+            scheduler.step()
 
     emissions_kg = tracker.stop()
     emissions_data = getattr(tracker, "final_emissions_data", None)
@@ -300,6 +356,11 @@ def _write_report_csv(
         "model",
         "database",
         "device",
+        "optimizer",
+        "loss_function",
+        "weight_decay",
+        "scheduler",
+        "seed",
     ]
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -320,6 +381,11 @@ def _write_report_csv(
                     "model": config.model,
                     "database": config.database,
                     "device": config.device,
+                    "optimizer": config.optimizer,
+                    "loss_function": config.loss_function,
+                    "weight_decay": config.weight_decay,
+                    "scheduler": config.scheduler,
+                    "seed": config.seed,
                 }
             )
 
@@ -336,7 +402,88 @@ def _write_report_csv(
                 "model": config.model,
                 "database": config.database,
                 "device": config.device,
+                "optimizer": config.optimizer,
+                "loss_function": config.loss_function,
+                "weight_decay": config.weight_decay,
+                "scheduler": config.scheduler,
+                "seed": config.seed,
             }
         )
+
+
+def _build_loss(name: str) -> "nn.Module":  # type: ignore[name-defined]
+    assert nn is not None
+    key = (name or "cross_entropy").lower()
+    mapping = {
+        "cross_entropy": nn.CrossEntropyLoss,
+        "mse": nn.MSELoss,
+        "l1": nn.L1Loss,
+        "smooth_l1": nn.SmoothL1Loss,
+        "binary_cross_entropy": nn.BCEWithLogitsLoss,
+    }
+    if key in mapping:
+        return mapping[key]()
+    # Fallback to CrossEntropyLoss but warn the user
+    print(f"[warn] Unsupported loss '{name}'. Falling back to CrossEntropyLoss.")
+    return nn.CrossEntropyLoss()
+
+
+def _build_optimizer(
+    name: str,
+    params,
+    *,
+    lr: float,
+    weight_decay: float,
+    momentum: float,
+):
+    assert torch is not None
+    key = (name or "adam").lower()
+
+    if key == "adam":
+        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+    if key == "adamw":
+        return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    if key == "sgd":
+        return torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
+    if key == "rmsprop":
+        return torch.optim.RMSprop(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
+    if key == "lion":
+        try:
+            from lion_pytorch import Lion  # type: ignore
+
+            return Lion(params, lr=lr, weight_decay=weight_decay)
+        except Exception:
+            print("[warn] lion optimizer requested but lion-pytorch is not installed. Using Adam instead.")
+            return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+
+    print(f"[warn] Unsupported optimizer '{name}'. Falling back to Adam.")
+    return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+
+
+def _build_scheduler(config: Dict[str, Any], optimizer) -> Optional[Any]:
+    if not isinstance(config, dict):
+        return None
+    sched_type = (config.get("type") or "none").lower()
+    params = config.get("params", {}) or {}
+
+    if sched_type in {"none", ""}:
+        return None
+
+    if sched_type == "step_lr":
+        step_size = int(params.get("step_size", 10))
+        gamma = float(params.get("gamma", 0.1))
+        return torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
+
+    if sched_type == "cosine_annealing":
+        t_max = int(params.get("t_max", 10))
+        eta_min = float(params.get("eta_min", 0.0))
+        return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max, eta_min=eta_min)
+
+    if sched_type == "exponential":
+        gamma = float(params.get("gamma", 0.95))
+        return torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)
+
+    print(f"[warn] Unsupported scheduler '{config.get('type')}'. Scheduler disabled.")
+    return None
 
 

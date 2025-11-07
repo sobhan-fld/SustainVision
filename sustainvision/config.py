@@ -63,13 +63,35 @@ class TrainingConfig:
     - database: dataset name or filesystem path
     - device: "cpu" or "cuda:{index}"
     - hyperparameters: batch size, learning rate, epochs, etc.
+    - report_filename: CSV file name for training metrics + emissions
+    - seed: reproducibility control for PyTorch/Numpy
+    - optimizer / loss_function: training algorithm choices
+    - weight_decay: L2 regularization strength
+    - scheduler: learning-rate scheduler configuration
+    - gradient_clip_norm: optional gradient clipping threshold
+    - mixed_precision: enable/disable automatic mixed precision (AMP)
     """
 
     model: str = "resnet18"
-    database: str = "path/to/dataset"
+    database: str = "databases/sample_dataset"
     device: str = "cpu"
+    seed: int = 42
+    optimizer: str = "adam"
+    loss_function: str = "cross_entropy"
+    weight_decay: float = 0.0
+    scheduler: Dict[str, Any] = field(
+        default_factory=lambda: {"type": "none", "params": {}}
+    )
+    gradient_clip_norm: Optional[float] = None
+    mixed_precision: bool = False
+    report_filename: str = "training_report.csv"
     hyperparameters: Dict[str, Any] = field(
-        default_factory=lambda: {"batch_size": 32, "lr": 1e-3, "epochs": 3}
+        default_factory=lambda: {
+            "batch_size": 32,
+            "lr": 1e-3,
+            "epochs": 3,
+            "momentum": 0.9,
+        }
     )
 
 
@@ -116,6 +138,14 @@ class ConfigManager:
             incoming_hp = merged.get("hyperparameters") or {}
             merged["hyperparameters"] = {**default_hp, **incoming_hp}
 
+            default_sched = default_dict.get("scheduler", {}) or {}
+            incoming_sched = merged.get("scheduler") or {}
+            merged_sched = {**default_sched, **incoming_sched}
+            default_sched_params = default_sched.get("params", {}) if isinstance(default_sched, dict) else {}
+            incoming_sched_params = incoming_sched.get("params", {}) if isinstance(incoming_sched, dict) else {}
+            merged_sched["params"] = {**default_sched_params, **incoming_sched_params}
+            merged["scheduler"] = merged_sched
+
             self._config = TrainingConfig(**merged)
         return self._config
 
@@ -131,6 +161,14 @@ class ConfigManager:
         model: Optional[str] = None,
         database: Optional[str] = None,
         device: Optional[str] = None,
+        seed: Optional[int] = None,
+        optimizer: Optional[str] = None,
+        loss_function: Optional[str] = None,
+        weight_decay: Optional[float] = None,
+        scheduler: Optional[Dict[str, Any]] = None,
+        gradient_clip_norm: Optional[float] = None,
+        mixed_precision: Optional[bool] = None,
+        report_filename: Optional[str] = None,
         hyperparameters: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Update selected fields in the in-memory configuration.
@@ -143,6 +181,26 @@ class ConfigManager:
             self._config.database = database
         if device is not None:
             self._config.device = device
+        if seed is not None:
+            self._config.seed = int(seed)
+        if optimizer is not None:
+            self._config.optimizer = optimizer
+        if loss_function is not None:
+            self._config.loss_function = loss_function
+        if weight_decay is not None:
+            self._config.weight_decay = float(weight_decay)
+        if scheduler is not None:
+            sched = {**self._config.scheduler, **scheduler}
+            default_params = self._config.scheduler.get("params", {}) if isinstance(self._config.scheduler, dict) else {}
+            incoming_params = scheduler.get("params", {}) if isinstance(scheduler, dict) else {}
+            sched["params"] = {**default_params, **incoming_params}
+            self._config.scheduler = sched
+        if gradient_clip_norm is not None:
+            self._config.gradient_clip_norm = gradient_clip_norm
+        if mixed_precision is not None:
+            self._config.mixed_precision = bool(mixed_precision)
+        if report_filename is not None:
+            self._config.report_filename = report_filename
         if hyperparameters is not None:
             # Update (not replace) to preserve non-provided keys
             self._config.hyperparameters.update(hyperparameters)

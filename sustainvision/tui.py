@@ -6,7 +6,7 @@ It relies on the ConfigManager to handle reading/writing YAML and device detecti
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import questionary
 
@@ -64,6 +64,7 @@ def _ask_hyperparameters(hp: Dict[str, Any]) -> Dict[str, Any]:
     batch_size = questionary.text("batch_size:", default=str(hp.get("batch_size", 32))).ask()
     lr = questionary.text("learning rate:", default=str(hp.get("lr", 1e-3))).ask()
     epochs = questionary.text("epochs:", default=str(hp.get("epochs", 3))).ask()
+    momentum = questionary.text("momentum (SGD-based optimizers):", default=str(hp.get("momentum", 0.9))).ask()
 
     def as_int(value: str, default: int) -> int:
         try:
@@ -81,7 +82,132 @@ def _ask_hyperparameters(hp: Dict[str, Any]) -> Dict[str, Any]:
         "batch_size": as_int(batch_size, hp.get("batch_size", 32)),
         "lr": as_float(lr, hp.get("lr", 1e-3)),
         "epochs": as_int(epochs, hp.get("epochs", 3)),
+        "momentum": as_float(momentum, hp.get("momentum", 0.9)),
     }
+
+
+def _ask_seed(current: int) -> int:
+    seed = questionary.text("Random seed:", default=str(current)).ask()
+    try:
+        return int(seed)
+    except Exception:
+        return current
+
+
+def _ask_optimizer(current: str) -> str:
+    options = ["adam", "adamw", "sgd", "rmsprop", "lion", "custom"]
+    choice = questionary.select(
+        "Optimizer:",
+        choices=options,
+        default=current if current in options else "custom",
+    ).ask()
+    if choice == "custom":
+        return questionary.text("Enter optimizer name:", default=current).ask()
+    return choice
+
+
+def _ask_loss_function(current: str) -> str:
+    options = ["cross_entropy", "mse", "l1", "smooth_l1", "binary_cross_entropy", "custom"]
+    choice = questionary.select(
+        "Loss function:",
+        choices=options,
+        default=current if current in options else "custom",
+    ).ask()
+    if choice == "custom":
+        return questionary.text("Enter loss function:", default=current).ask()
+    return choice
+
+
+def _ask_weight_decay(current: float) -> float:
+    value = questionary.text("Weight decay:", default=str(current)).ask()
+    try:
+        return float(value)
+    except Exception:
+        return current
+
+
+def _ask_scheduler(scheduler: Dict[str, Any]) -> Dict[str, Any]:
+    sched_type = scheduler.get("type", "none")
+    options = ["none", "step_lr", "cosine_annealing", "exponential", "custom"]
+    choice = questionary.select(
+        "Scheduler:",
+        choices=options,
+        default=sched_type if sched_type in options else "custom",
+    ).ask()
+
+    if choice == "none":
+        return {"type": "none", "params": {}}
+
+    if choice == "custom":
+        custom_type = questionary.text("Scheduler name:", default=sched_type).ask()
+        params_text = questionary.text(
+            "Scheduler params as key=value pairs (comma separated):",
+            default=", ".join(f"{k}={v}" for k, v in (scheduler.get("params", {}) or {}).items()),
+        ).ask()
+        return {"type": custom_type, "params": _parse_params(params_text)}
+
+    params_defaults = {
+        "step_lr": {"step_size": 10, "gamma": 0.1},
+        "cosine_annealing": {"t_max": 10, "eta_min": 0.0},
+        "exponential": {"gamma": 0.95},
+    }
+    defaults = params_defaults.get(choice, {})
+    params = {}
+    for key, default in defaults.items():
+        value = questionary.text(f"{choice}::{key}", default=str(scheduler.get("params", {}).get(key, default))).ask()
+        params[key] = _safe_number(value, default)
+    return {"type": choice, "params": params}
+
+
+def _parse_params(raw: Optional[str]) -> Dict[str, Any]:
+    if not raw:
+        return {}
+    result: Dict[str, Any] = {}
+    for part in raw.split(","):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        result[key] = _safe_number(value, value)
+    return result
+
+
+def _safe_number(value: str, default: Any) -> Any:
+    try:
+        value_str = str(value)
+        if "." in value_str:
+            return float(value_str)
+        return int(value_str)
+    except Exception:
+        return default
+
+
+def _ask_gradient_clip(current: Optional[float]) -> Optional[float]:
+    default_value = "none" if current is None else str(current)
+    answer = questionary.text(
+        "Gradient clip norm (enter 'none' to disable):",
+        default=default_value,
+    ).ask()
+    if answer is None:
+        return current
+    answer = answer.strip().lower()
+    if answer in {"none", "", "off"}:
+        return None
+    try:
+        return float(answer)
+    except Exception:
+        return current
+
+
+def _ask_mixed_precision(current: bool) -> bool:
+    answer = questionary.confirm(
+        "Enable automatic mixed precision (AMP)?",
+        default=current,
+    ).ask()
+    if answer is None:
+        return current
+    return bool(answer)
 
 
 def run_config_tui(config_path: str | None = None) -> TrainingConfig:
@@ -97,6 +223,14 @@ def run_config_tui(config_path: str | None = None) -> TrainingConfig:
     print(f"- model: {cfg.model}")
     print(f"- database: {cfg.database}")
     print(f"- device: {cfg.device}")
+    print(f"- seed: {cfg.seed}")
+    print(f"- optimizer: {cfg.optimizer}")
+    print(f"- loss_function: {cfg.loss_function}")
+    print(f"- weight_decay: {cfg.weight_decay}")
+    print(f"- scheduler: {cfg.scheduler}")
+    print(f"- gradient_clip_norm: {cfg.gradient_clip_norm}")
+    print(f"- mixed_precision: {cfg.mixed_precision}")
+    print(f"- report_filename: {cfg.report_filename}")
     print(f"- hyperparameters: {cfg.hyperparameters}")
 
     action = questionary.select(
@@ -112,8 +246,32 @@ def run_config_tui(config_path: str | None = None) -> TrainingConfig:
     new_db = _ask_database(cfg.database)
     new_device = _ask_device(cfg.device, cm.available_devices)
     new_hp = _ask_hyperparameters(cfg.hyperparameters)
+    new_seed = _ask_seed(cfg.seed)
+    new_optimizer = _ask_optimizer(cfg.optimizer)
+    new_loss = _ask_loss_function(cfg.loss_function)
+    new_weight_decay = _ask_weight_decay(cfg.weight_decay)
+    new_scheduler = _ask_scheduler(cfg.scheduler)
+    new_clip = _ask_gradient_clip(cfg.gradient_clip_norm)
+    new_amp = _ask_mixed_precision(cfg.mixed_precision)
+    report_name = questionary.text(
+        "CSV report filename (saved in project root):",
+        default=cfg.report_filename,
+    ).ask()
 
-    cm.set(model=new_model, database=new_db, device=new_device, hyperparameters=new_hp)
+    cm.set(
+        model=new_model,
+        database=new_db,
+        device=new_device,
+        seed=new_seed,
+        optimizer=new_optimizer,
+        loss_function=new_loss,
+        weight_decay=new_weight_decay,
+        scheduler=new_scheduler,
+        gradient_clip_norm=new_clip,
+        mixed_precision=new_amp,
+        report_filename=report_name,
+        hyperparameters=new_hp,
+    )
     cm.save()
     print("\nConfig saved.")
     return cm.config
