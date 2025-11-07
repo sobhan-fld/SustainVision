@@ -1,0 +1,5 @@
+questionary>=2.0.1
+PyYAML>=6.0.1
+# Optional, for device discovery (CUDA availability). If not installed, device list will be ["cpu"].
+torch>=2.1.0; platform_system != "Darwin" or platform_machine != "arm64"
+
