@@ -3,6 +3,7 @@ PyYAML>=6.0.1
 codecarbon>=2.5.0
 # Utility packages used across the tooling
 numpy>=1.24
+tqdm>=4.66
 # Optional: install PyTorch to enable GPU training and CUDA device detection.
 # Adjust the selector to match your platform needs.
 torch>=2.1.0; platform_system != "Darwin" or platform_machine != "arm64"
@@ -12,4 +13,3 @@ torchvision>=0.16.0; platform_system != "Darwin" or platform_machine != "arm64"
 colorama>=0.4.6; platform_system == "Windows"
 # Optional: Lion optimizer support
 lion-pytorch>=0.1.2
-
