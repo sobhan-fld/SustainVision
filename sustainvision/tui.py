@@ -244,6 +244,14 @@ def _ask_mixed_precision(current: bool) -> bool:
     return bool(answer)
 
 
+def _safe_positive_int(value: Optional[str], default: int) -> int:
+    try:
+        parsed = int(value) if value is not None else default
+        return parsed if parsed > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
 def run_config_tui(config_path: str | None = None) -> TrainingConfig:
     """Run the interactive configuration flow and persist the result.
 
@@ -287,6 +295,43 @@ def run_config_tui(config_path: str | None = None) -> TrainingConfig:
     new_scheduler = _ask_scheduler(cfg.scheduler)
     new_clip = _ask_gradient_clip(cfg.gradient_clip_norm)
     new_amp = _ask_mixed_precision(cfg.mixed_precision)
+    save_model = questionary.confirm(
+        "Persist trained model weights after each run?",
+        default=cfg.save_model,
+    ).ask()
+    if save_model is None:
+        save_model = cfg.save_model
+    save_model_path = questionary.text(
+        "Model artifact directory:",
+        default=cfg.save_model_path,
+    ).ask()
+    if not save_model_path:
+        save_model_path = cfg.save_model_path
+    early_enabled = questionary.confirm(
+        "Enable early stopping?",
+        default=cfg.early_stopping.get("enabled", False),
+    ).ask()
+    if early_enabled is None:
+        early_enabled = cfg.early_stopping.get("enabled", False)
+    early_patience = questionary.text(
+        "Early stopping patience (epochs):",
+        default=str(cfg.early_stopping.get("patience", 5)),
+    ).ask()
+    patience_value = _safe_positive_int(early_patience, cfg.early_stopping.get("patience", 5))
+    early_metric = questionary.select(
+        "Monitor metric:",
+        choices=["val_loss", "val_accuracy", "train_loss", "train_accuracy"],
+        default=cfg.early_stopping.get("metric", "val_loss"),
+    ).ask()
+    if early_metric is None:
+        early_metric = cfg.early_stopping.get("metric", "val_loss")
+    early_mode = questionary.select(
+        "Early stopping mode:",
+        choices=["min", "max"],
+        default=cfg.early_stopping.get("mode", "min"),
+    ).ask()
+    if early_mode is None:
+        early_mode = cfg.early_stopping.get("mode", "min")
     report_name = questionary.text(
         "CSV report filename (saved in project root):",
         default=cfg.report_filename,
@@ -303,6 +348,14 @@ def run_config_tui(config_path: str | None = None) -> TrainingConfig:
         scheduler=new_scheduler,
         gradient_clip_norm=new_clip,
         mixed_precision=new_amp,
+        save_model=save_model,
+        save_model_path=save_model_path,
+        early_stopping={
+            "enabled": early_enabled,
+            "patience": patience_value,
+            "metric": early_metric,
+            "mode": early_mode,
+        },
         report_filename=report_name,
         hyperparameters=new_hp,
     )

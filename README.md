@@ -122,6 +122,8 @@ Configuration Reference
 - `scheduler`: Learning rate scheduler descriptor (`type` + `params`)
 - `gradient_clip_norm`: Optional gradient clipping threshold
 - `mixed_precision`: Toggle automatic mixed precision (AMP)
+- `save_model`: `True/False` to store the trained weights after each run
+- `save_model_path`: Directory where checkpoints are written (default `artifacts/`)
 - `hyperparameters`
   - `batch_size`
   - `lr`
@@ -165,6 +167,12 @@ Available Options Cheat Sheet
 **Dataset Helpers**
 - `cifar10`, `mnist`, `synthetic`
 - Any ImageFolder layout (`train/`, `val/`, `test/` directories)
+
+**Early Stopping**
+- Toggle on/off and configure with:
+  - `patience` (epochs without improvement)
+  - `metric`: `val_loss`, `val_accuracy`, `train_loss`, `train_accuracy`
+  - `mode`: `min` or `max`
 
 **TUI Prompts**
 - Every prompt mirrors the config keys above; defaults are safe for CPU smoke tests (batch 32, 1 epoch, mobilenet, etc.).

@@ -70,6 +70,7 @@ class TrainingConfig:
     - scheduler: learning-rate scheduler configuration
     - gradient_clip_norm: optional gradient clipping threshold
     - mixed_precision: enable/disable automatic mixed precision (AMP)
+    - save_model/save_model_path: whether and where to persist trained weights
     """
 
     model: str = "resnet18"
@@ -84,6 +85,11 @@ class TrainingConfig:
     )
     gradient_clip_norm: Optional[float] = None
     mixed_precision: bool = False
+    save_model: bool = False
+    save_model_path: str = "artifacts"
+    early_stopping: Dict[str, Any] = field(
+        default_factory=lambda: {"enabled": False, "patience": 5, "metric": "val_loss", "mode": "min"}
+    )
     report_filename: str = "training_report.csv"
     hyperparameters: Dict[str, Any] = field(
         default_factory=lambda: {
@@ -173,7 +179,10 @@ class ConfigManager:
         scheduler: Optional[Dict[str, Any]] = None,
         gradient_clip_norm: Optional[float] = None,
         mixed_precision: Optional[bool] = None,
+        save_model: Optional[bool] = None,
+        save_model_path: Optional[str] = None,
         report_filename: Optional[str] = None,
+        early_stopping: Optional[Dict[str, Any]] = None,
         hyperparameters: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Update selected fields in the in-memory configuration.
@@ -204,6 +213,13 @@ class ConfigManager:
             self._config.gradient_clip_norm = gradient_clip_norm
         if mixed_precision is not None:
             self._config.mixed_precision = bool(mixed_precision)
+        if save_model is not None:
+            self._config.save_model = bool(save_model)
+        if save_model_path is not None:
+            self._config.save_model_path = save_model_path
+        if early_stopping is not None:
+            merged = {**self._config.early_stopping, **early_stopping}
+            self._config.early_stopping = merged
         if report_filename is not None:
             self._config.report_filename = report_filename
         if hyperparameters is not None:

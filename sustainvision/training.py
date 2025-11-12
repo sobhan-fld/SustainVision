@@ -16,10 +16,11 @@ that matches your project once you connect SustainVision to real workloads.
 
 from __future__ import annotations
 
+import copy
 import csv
 import random
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -243,6 +244,25 @@ def train_model(
 
     start_time = time.perf_counter()
 
+    early_cfg = config.early_stopping or {}
+    early_enabled = bool(early_cfg.get("enabled", False))
+    raw_patience = early_cfg.get("patience", 5)
+    try:
+        early_patience = max(1, int(raw_patience))
+    except (TypeError, ValueError):
+        early_patience = 5
+    early_metric = str(early_cfg.get("metric", "val_loss")).lower()
+    early_mode = str(early_cfg.get("mode", "min")).lower()
+    if early_metric not in {"val_loss", "val_accuracy", "train_loss", "train_accuracy"}:
+        early_metric = "val_loss"
+    if early_mode not in {"min", "max"}:
+        early_mode = "min"
+    best_metric: Optional[float] = None
+    patience_counter = 0
+    best_state: Optional[Dict[str, Any]] = None
+    early_stopped = False
+    best_epoch = 0
+
     try:
         epoch_iterable = range(1, epochs + 1)
         use_tqdm = False
@@ -347,6 +367,44 @@ def train_model(
             else:
                 print(message)
 
+            metrics_map = {
+                "train_loss": train_loss,
+                "train_accuracy": train_acc,
+                "val_loss": val_loss,
+                "val_accuracy": val_acc,
+            }
+            current_metric = metrics_map.get(early_metric, val_loss)
+            if early_enabled:
+                improved = False
+                if best_metric is None:
+                    improved = True
+                elif early_mode == "min":
+                    improved = current_metric < best_metric - 1e-6
+                else:
+                    improved = current_metric > best_metric + 1e-6
+
+                if improved:
+                    best_metric = current_metric
+                    patience_counter = 0
+                    best_state = {
+                        "model": copy.deepcopy(model.state_dict()),
+                        "optimizer": copy.deepcopy(optimizer.state_dict()),
+                    }
+                    best_epoch = epoch
+                else:
+                    patience_counter += 1
+                    if patience_counter >= early_patience:
+                        early_stopped = True
+                        notice = (
+                            f"[info] Early stopping triggered after {epoch} epochs "
+                            f"(no improvement in {early_patience} epochs)."
+                        )
+                        if use_tqdm and hasattr(epoch_iterable, "write"):
+                            epoch_iterable.write(notice)
+                        else:
+                            print(notice)
+                        break
+
             if scheduler is not None:
                 scheduler.step()
         if use_tqdm and hasattr(epoch_iterable, "close"):
@@ -358,6 +416,34 @@ def train_model(
         if emissions_kg is None:
             emissions_kg = tracker.stop()
             emissions_data = getattr(tracker, "final_emissions_data", None)
+
+    if early_enabled and best_state is not None:
+        model.load_state_dict(best_state["model"])
+        optimizer.load_state_dict(best_state["optimizer"])
+        if best_metric is not None:
+            print(
+                f"[info] Restored best model from epoch {best_epoch} "
+                f"({early_metric}={best_metric:.4f})."
+            )
+
+    if config.save_model:
+        artifact_dir = Path(config.save_model_path or "artifacts")
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+        base_name = f"{report_path.stem}_model.pt"
+        model_path = artifact_dir / base_name
+        counter = 1
+        while model_path.exists():
+            model_path = artifact_dir / f"{report_path.stem}_model_{counter}.pt"
+            counter += 1
+        torch.save(
+            {
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "config": asdict(config),
+            },
+            model_path,
+        )
+        print(f"[info] Model checkpoint saved to {model_path}")
 
     duration = time.perf_counter() - start_time
     energy_kwh = None
