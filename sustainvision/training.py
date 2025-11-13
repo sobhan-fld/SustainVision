@@ -62,6 +62,7 @@ class EpochMetrics:
     train_accuracy: float
     val_loss: float
     val_accuracy: float
+    learning_rate: float
 
 
 @dataclass
@@ -212,15 +213,43 @@ def train_model(
         image_size=image_size,
         projection_dim=projection_dim,
     ).to(device)
+
+    if config.checkpoint_path:
+        checkpoint_file = Path(config.checkpoint_path)
+        if not checkpoint_file.is_absolute():
+            checkpoint_file = project_dir / checkpoint_file
+        if checkpoint_file.exists():
+            print(f"[info] Loading checkpoint from {checkpoint_file}")
+            checkpoint = torch.load(checkpoint_file, map_location=device)
+            if "model_state" in checkpoint:
+                model.load_state_dict(checkpoint["model_state"], strict=False)
+                print("[info] Loaded model weights from checkpoint")
+            elif "model" in checkpoint:
+                model.load_state_dict(checkpoint["model"], strict=False)
+                print("[info] Loaded model weights from checkpoint")
+            else:
+                model.load_state_dict(checkpoint, strict=False)
+                print("[info] Loaded model weights from checkpoint")
+        else:
+            raise MissingDependencyError(f"Checkpoint file not found: {checkpoint_file}")
+
+    if config.freeze_backbone and hasattr(model, "backbone"):
+        for param in model.backbone.parameters():
+            param.requires_grad = False
+        print("[info] Backbone frozen - only classifier head will be trained")
+    elif config.freeze_backbone:
+        print("[warn] freeze_backbone requested but model has no 'backbone' attribute")
+
     try:
         model_device = next(model.parameters()).device
         print(f"[info] Training on device: {model_device}")
     except StopIteration:
         print("[info] Training on device: unknown (model has no parameters)")
 
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = _build_optimizer(
         config.optimizer,
-        model.parameters(),
+        trainable_params,
         lr=learning_rate,
         weight_decay=config.weight_decay,
         momentum=momentum,
@@ -253,6 +282,13 @@ def train_model(
         early_patience = 5
     early_metric = str(early_cfg.get("metric", "val_loss")).lower()
     early_mode = str(early_cfg.get("mode", "min")).lower()
+    if loss_spec.mode in {"simclr", "supcon"} and early_metric == "val_accuracy":
+        early_metric = "train_loss"
+        early_mode = "min"
+        print(
+            "[info] Contrastive loss detected: using train_loss for early stopping "
+            "(val_accuracy not meaningful for representation learning)."
+        )
     if early_metric not in {"val_loss", "val_accuracy", "train_loss", "train_accuracy"}:
         early_metric = "val_loss"
     if early_mode not in {"min", "max"}:
@@ -346,6 +382,7 @@ def train_model(
 
             val_loss = val_loss_accum / val_total if val_total else 0.0
             val_acc = val_correct / val_total if val_total else 0.0
+            current_lr = optimizer.param_groups[0].get("lr", 0.0)
 
             epoch_metrics.append(
                 EpochMetrics(
@@ -354,13 +391,15 @@ def train_model(
                     train_accuracy=train_acc,
                     val_loss=val_loss,
                     val_accuracy=val_acc,
+                    learning_rate=current_lr,
                 )
             )
 
             message = (
                 f"Epoch {epoch:02d}/{epochs} - "
                 f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
-                f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
+                f"val_loss={val_loss:.4f} val_acc={val_acc:.4f} "
+                f"lr={current_lr:.6f}"
             )
             if use_tqdm and hasattr(epoch_iterable, "write"):
                 epoch_iterable.write(message)
@@ -489,6 +528,7 @@ def _write_report_csv(
         "train_accuracy",
         "val_loss",
         "val_accuracy",
+        "learning_rate",
         "emissions_kg",
         "energy_kwh",
         "duration_seconds",
@@ -503,6 +543,8 @@ def _write_report_csv(
         "temperature",
     ]
 
+    last_lr = epochs[-1].learning_rate if epochs else None
+
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -515,6 +557,7 @@ def _write_report_csv(
                     "train_accuracy": f"{metrics.train_accuracy:.6f}",
                     "val_loss": f"{metrics.val_loss:.6f}",
                     "val_accuracy": f"{metrics.val_accuracy:.6f}",
+                    "learning_rate": f"{metrics.learning_rate:.6f}",
                     "emissions_kg": "",
                     "energy_kwh": "",
                     "duration_seconds": "",
@@ -537,6 +580,7 @@ def _write_report_csv(
                 "train_accuracy": "",
                 "val_loss": "",
                 "val_accuracy": "",
+                "learning_rate": f"{last_lr:.6f}" if last_lr is not None else "",
                 "emissions_kg": f"{emissions_kg:.6f}" if emissions_kg is not None else "",
                 "energy_kwh": f"{energy_kwh:.6f}" if energy_kwh is not None else "",
                 "duration_seconds": f"{duration_seconds:.2f}" if duration_seconds is not None else "",

@@ -87,6 +87,8 @@ class TrainingConfig:
     mixed_precision: bool = False
     save_model: bool = False
     save_model_path: str = "artifacts"
+    checkpoint_path: Optional[str] = None
+    freeze_backbone: bool = False
     early_stopping: Dict[str, Any] = field(
         default_factory=lambda: {"enabled": False, "patience": 5, "metric": "val_loss", "mode": "min"}
     )
@@ -181,6 +183,8 @@ class ConfigManager:
         mixed_precision: Optional[bool] = None,
         save_model: Optional[bool] = None,
         save_model_path: Optional[str] = None,
+        checkpoint_path: Optional[str] = None,
+        freeze_backbone: Optional[bool] = None,
         report_filename: Optional[str] = None,
         early_stopping: Optional[Dict[str, Any]] = None,
         hyperparameters: Optional[Dict[str, Any]] = None,
@@ -217,6 +221,10 @@ class ConfigManager:
             self._config.save_model = bool(save_model)
         if save_model_path is not None:
             self._config.save_model_path = save_model_path
+        if checkpoint_path is not None:
+            self._config.checkpoint_path = checkpoint_path
+        if freeze_backbone is not None:
+            self._config.freeze_backbone = bool(freeze_backbone)
         if early_stopping is not None:
             merged = {**self._config.early_stopping, **early_stopping}
             self._config.early_stopping = merged

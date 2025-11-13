@@ -307,6 +307,22 @@ def run_config_tui(config_path: str | None = None) -> TrainingConfig:
     ).ask()
     if not save_model_path:
         save_model_path = cfg.save_model_path
+    checkpoint_path = questionary.text(
+        "Checkpoint path for fine-tuning (leave empty for training from scratch):",
+        default=cfg.checkpoint_path or "",
+    ).ask()
+    if not checkpoint_path or checkpoint_path.strip() == "":
+        checkpoint_path = None
+    else:
+        checkpoint_path = checkpoint_path.strip()
+    freeze_backbone = False
+    if checkpoint_path is not None:
+        freeze_backbone = questionary.confirm(
+            "Freeze backbone (only train classifier head)?",
+            default=cfg.freeze_backbone,
+        ).ask()
+        if freeze_backbone is None:
+            freeze_backbone = cfg.freeze_backbone
     early_enabled = questionary.confirm(
         "Enable early stopping?",
         default=cfg.early_stopping.get("enabled", False),
@@ -350,6 +366,8 @@ def run_config_tui(config_path: str | None = None) -> TrainingConfig:
         mixed_precision=new_amp,
         save_model=save_model,
         save_model_path=save_model_path,
+        checkpoint_path=checkpoint_path,
+        freeze_backbone=freeze_backbone,
         early_stopping={
             "enabled": early_enabled,
             "patience": patience_value,

@@ -95,6 +95,27 @@ Training Workflow & Output
   - Columns include: epoch, train/val loss & accuracy, emissions, energy, run
     duration, and config metadata (model/database/device).
 
+Fine-Tuning Workflow
+--------------------
+
+For self-supervised learning (SimCLR/SupCon), use a two-stage approach:
+
+1. **Pre-training**: Train with contrastive loss to learn representations
+   - Set `loss_function: simclr` or `supcon`
+   - Enable model saving to get a checkpoint
+   - Early stopping automatically uses `train_loss` (not `val_accuracy`)
+
+2. **Fine-tuning**: Load the checkpoint and train with classification loss
+   - Set `checkpoint_path` to your saved checkpoint (e.g., `resnet18_simclr_checkpoints/resnet18_simclr_model.pt`)
+   - Change `loss_function` to `cross_entropy`
+   - Optionally set `freeze_backbone: True` for linear evaluation (faster, evaluates representation quality)
+   - Or leave `freeze_backbone: False` for full fine-tuning (usually better accuracy)
+
+Example: After training ResNet18 with SimCLR, fine-tune it:
+- `checkpoint_path: resnet18_simclr_checkpoints/resnet18_simclr_model.pt`
+- `loss_function: cross_entropy`
+- `freeze_backbone: False` (or `True` for linear eval)
+
 Programmatic Access
 -------------------
 
@@ -124,6 +145,10 @@ Configuration Reference
 - `mixed_precision`: Toggle automatic mixed precision (AMP)
 - `save_model`: `True/False` to store the trained weights after each run
 - `save_model_path`: Directory where checkpoints are written (default `artifacts/`)
+- `checkpoint_path`: Optional path to a checkpoint file for fine-tuning (leave empty for training from scratch)
+- `freeze_backbone`: If fine-tuning, freeze the encoder/backbone and only train the classifier head
+- `early_stopping`: Configuration dict with `enabled`, `patience`, `metric`, and `mode`
+  - Note: For contrastive losses (SimCLR/SupCon), `val_accuracy` is automatically replaced with `train_loss`
 - `hyperparameters`
   - `batch_size`
   - `lr`
