@@ -1,6 +1,8 @@
 SustainVision: Green AI Training Platform
 ========================================
 
+Maintained by **Sobhan Fooladi Mahani (CTTC)**.
+
 SustainVision is an innovative, user-centric Machine Vision (MV) training platform
 dedicated to advancing the practice of Green AI. It empowers developers,
 researchers, and students to quantify and minimize the environmental impact of
@@ -226,13 +228,10 @@ Dependencies Overview
 Contributing & Feedback
 -----------------------
 
-- Issues and feature requests are welcome—especially around sustainability
-  metrics, dataset integrations, and carbon accounting workflows.
-- Contributions should follow standard Python best practices (linting, typing
-  where feasible, and clear docstrings for new components).
+We welcome issues, feature requests, and success stories. Tell us how you are using SustainVision, where the workflows feel clunky, or what sustainability metrics you would love to track next. If you plan to open a pull request, please follow common Python conventions (linting, type hints where practical, and clear docstrings that explain why a change exists).
 
 License
 -------
 
-Please add a license file to clarify usage (MIT, Apache 2.0, etc.).
+Released under the MIT License. See the `LICENSE` file for details.
 
