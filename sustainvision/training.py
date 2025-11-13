@@ -22,6 +22,7 @@ import random
 import time
 from dataclasses import dataclass, asdict
 import logging
+import yaml
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -482,7 +483,12 @@ def train_model(
             },
             model_path,
         )
+        config_yaml_path = model_path.with_suffix('.yaml')
+        with config_yaml_path.open('w', encoding='utf-8') as cfg_handle:
+            yaml.safe_dump(asdict(config), cfg_handle, sort_keys=False)
+
         print(f"[info] Model checkpoint saved to {model_path}")
+        print(f"[info] Config snapshot written to {config_yaml_path}")
 
     duration = time.perf_counter() - start_time
     energy_kwh = None
