@@ -8,11 +8,12 @@ dedicated to advancing the practice of Green AI. It empowers developers,
 researchers, and students to quantify and minimize the environmental impact of
 their deep learning projects.
 
-The repository currently focuses on the interactive configuration layer that
-orchestrates model selection, dataset setup, hardware targeting, and
-hyperparameter tuning. The configuration is persisted so future training runs can
-share the same baseline—an essential step toward reproducible, low-impact
-experiments.
+The repository provides an interactive configuration layer that orchestrates
+model selection, dataset setup, hardware targeting, and hyperparameter tuning.
+The configuration is persisted so future training runs can share the same
+baseline—an essential step toward reproducible, low-impact experiments. The
+codebase is modular, with training logic organized into focused modules for
+losses, optimizers, models, reporting, and schedule management.
 
 Key Capabilities
 ----------------
@@ -27,7 +28,12 @@ Key Capabilities
 - Advanced training controls: optimizer/loss selection (Cross-Entropy, SimCLR,
   SupCon, etc.), weight decay, schedulers, AMP toggle, gradient clipping, and
   reproducibility seed management
+- **Contrastive learning alternating schedule**: Automate pretrain/finetune cycles
+  for SimCLR/SupCon with configurable epochs per phase, learning rates, and
+  backbone freezing options
 - Dataset download helper that stores assets under `databases/` (ignored by git)
+- Modular codebase: Training logic split into focused modules (utils, losses,
+  optimizers, models, reporting, schedule) for better maintainability
 
 Planned Enhancements
 --------------------
@@ -94,13 +100,18 @@ Training Workflow & Output
     `training_report.csv`).
   - If a file with the same name already exists, an index is appended (e.g.,
     `training_report_1.csv`).
-  - Columns include: epoch, train/val loss & accuracy, emissions, energy, run
-    duration, and config metadata (model/database/device).
+  - Columns include: epoch, phase (e.g., `pretrain_cycle_1`, `finetune_cycle_1`),
+    train/val loss & accuracy, learning rate, emissions, energy, run duration, and
+    config metadata (model/database/device).
+  - For alternating schedules, all phases are logged in a single CSV with
+    continuous epoch numbering and phase labels.
 
 Fine-Tuning Workflow
 --------------------
 
-For self-supervised learning (SimCLR/SupCon), use a two-stage approach:
+For self-supervised learning (SimCLR/SupCon), you have two options:
+
+### Option 1: Manual Two-Stage Approach
 
 1. **Pre-training**: Train with contrastive loss to learn representations
    - Set `loss_function: simclr` or `supcon`
@@ -108,15 +119,45 @@ For self-supervised learning (SimCLR/SupCon), use a two-stage approach:
    - Early stopping automatically uses `train_loss` (not `val_accuracy`)
 
 2. **Fine-tuning**: Load the checkpoint and train with classification loss
-   - Set `checkpoint_path` to your saved checkpoint (e.g., `resnet18_simclr_checkpoints/resnet18_simclr_model.pt`)
+   - Set `checkpoint_path` to your saved checkpoint (e.g., `artifacts/model_cycle1.pt`)
    - Change `loss_function` to `cross_entropy`
    - Optionally set `freeze_backbone: True` for linear evaluation (faster, evaluates representation quality)
    - Or leave `freeze_backbone: False` for full fine-tuning (usually better accuracy)
 
-Example: After training ResNet18 with SimCLR, fine-tune it:
-- `checkpoint_path: resnet18_simclr_checkpoints/resnet18_simclr_model.pt`
-- `loss_function: cross_entropy`
-- `freeze_backbone: False` (or `True` for linear eval)
+### Option 2: Automated Alternating Schedule (Recommended)
+
+Enable the contrastive learning alternating schedule to automatically run
+pretrain/finetune cycles:
+
+1. **Enable the schedule** in the TUI:
+   - Set `simclr_schedule.enabled: true`
+   - Configure cycles (e.g., 8 cycles of 50 pretrain + 20 finetune epochs)
+   - Set pretrain loss (`simclr` or `supcon`) and finetune loss (`cross_entropy`)
+   - Optionally set a different learning rate for finetune phase
+   - Choose whether to freeze backbone during finetune (linear evaluation)
+
+2. **The schedule automatically**:
+   - Runs pretrain phase (contrastive learning)
+   - Runs finetune phase (supervised learning)
+   - Saves checkpoints after each finetune phase (`_cycle1.pt`, `_cycle2.pt`, ...)
+   - Continues epoch numbering across all phases
+   - Tracks emissions for the entire run
+
+**Example configuration**:
+```yaml
+simclr_schedule:
+  enabled: true
+  cycles: 8
+  pretrain_epochs: 50
+  finetune_epochs: 20
+  pretrain_loss: simclr
+  finetune_loss: cross_entropy
+  finetune_lr: 0.01  # Optional: different LR for finetune
+  freeze_backbone: true  # Linear evaluation
+  optimizer_reset: true  # Reset optimizer between phases
+```
+
+This gives you 8 cycles × (50 + 20) = 560 total epochs with automatic phase switching.
 
 Programmatic Access
 -------------------
@@ -151,6 +192,16 @@ Configuration Reference
 - `freeze_backbone`: If fine-tuning, freeze the encoder/backbone and only train the classifier head
 - `early_stopping`: Configuration dict with `enabled`, `patience`, `metric`, and `mode`
   - Note: For contrastive losses (SimCLR/SupCon), `val_accuracy` is automatically replaced with `train_loss`
+- `simclr_schedule`: Contrastive learning alternating schedule configuration
+  - `enabled`: Enable/disable the schedule (default: `false`)
+  - `cycles`: Number of pretrain+finetune cycles (default: `8`)
+  - `pretrain_epochs`: Epochs per pretrain phase (default: `50`)
+  - `finetune_epochs`: Epochs per finetune phase (default: `20`)
+  - `pretrain_loss`: Loss for pretrain phase (`simclr` or `supcon`, default: `simclr`)
+  - `finetune_loss`: Loss for finetune phase (default: `cross_entropy`)
+  - `finetune_lr`: Learning rate for finetune (default: `None`, uses same as pretrain)
+  - `freeze_backbone`: Freeze backbone during finetune for linear evaluation (default: `false`)
+  - `optimizer_reset`: Reset optimizer between phases (default: `true`)
 - `hyperparameters`
   - `batch_size`
   - `lr`
@@ -201,8 +252,16 @@ Available Options Cheat Sheet
   - `metric`: `val_loss`, `val_accuracy`, `train_loss`, `train_accuracy`
   - `mode`: `min` or `max`
 
+**Contrastive Learning Schedule**
+- Enable alternating pretrain/finetune cycles
+- Configure number of cycles, epochs per phase, loss functions
+- Set separate learning rate for finetune phase
+- Choose to freeze backbone during finetune (linear evaluation)
+- Checkpoints saved after each finetune phase with cycle suffix
+
 **TUI Prompts**
 - Every prompt mirrors the config keys above; defaults are safe for CPU smoke tests (batch 32, 1 epoch, mobilenet, etc.).
+- Schedule configuration prompts appear when enabling the contrastive learning schedule.
 
 Dataset Storage
 ---------------
@@ -212,6 +271,28 @@ Dataset Storage
   directory present in version control).
 - After downloading via the menu, the configuration automatically updates to
   point to the freshly prepared dataset path.
+
+Code Structure
+--------------
+
+The codebase is organized into focused modules for maintainability:
+
+- **`config.py`**: Configuration management with YAML persistence
+- **`tui.py`**: Interactive text user interface for configuration
+- **`data.py`**: Dataset loading and download utilities
+- **`training.py`**: Core training loop and orchestration
+- **`schedule.py`**: Contrastive learning alternating schedule implementation
+- **`utils.py`**: Utility functions (device resolution, seeding, paths)
+- **`losses.py`**: Loss function implementations (SimCLR, SupCon, standard losses)
+- **`optimizers.py`**: Optimizer and scheduler builders
+- **`models.py`**: Model building utilities (torchvision backbones, projection heads)
+- **`reporting.py`**: CSV reporting and metrics logging
+
+This modular structure makes it easy to:
+- Understand what each component does
+- Test individual components
+- Extend functionality (e.g., add new loss functions or optimizers)
+- Maintain and debug the codebase
 
 Dependencies Overview
 ---------------------
