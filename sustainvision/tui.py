@@ -252,6 +252,90 @@ def _safe_positive_int(value: Optional[str], default: int) -> int:
         return default
 
 
+def _ask_simclr_schedule(schedule: Dict[str, Any]) -> Dict[str, Any]:
+    """Prompt the user for contrastive learning alternating schedule configuration."""
+    enabled = questionary.confirm(
+        "Enable contrastive learning alternating schedule (pretrain + finetune cycles)?",
+        default=schedule.get("enabled", False),
+    ).ask()
+    if enabled is None:
+        enabled = schedule.get("enabled", False)
+    
+    if not enabled:
+        return {**schedule, "enabled": False}
+    
+    cycles = questionary.text(
+        "Number of cycles (pretrain + finetune pairs):",
+        default=str(schedule.get("cycles", 8)),
+    ).ask()
+    cycles_value = _safe_positive_int(cycles, schedule.get("cycles", 8))
+    
+    pretrain_epochs = questionary.text(
+        "Pretrain epochs per cycle (contrastive learning):",
+        default=str(schedule.get("pretrain_epochs", 50)),
+    ).ask()
+    pretrain_value = _safe_positive_int(pretrain_epochs, schedule.get("pretrain_epochs", 50))
+    
+    finetune_epochs = questionary.text(
+        "Finetune epochs per cycle (cross-entropy):",
+        default=str(schedule.get("finetune_epochs", 20)),
+    ).ask()
+    finetune_value = _safe_positive_int(finetune_epochs, schedule.get("finetune_epochs", 20))
+    
+    pretrain_loss = questionary.select(
+        "Pretrain loss function:",
+        choices=["simclr", "supcon"],
+        default=schedule.get("pretrain_loss", "simclr"),
+    ).ask()
+    if pretrain_loss is None:
+        pretrain_loss = schedule.get("pretrain_loss", "simclr")
+    
+    finetune_loss = questionary.select(
+        "Finetune loss function:",
+        choices=["cross_entropy", "mse", "l1"],
+        default=schedule.get("finetune_loss", "cross_entropy"),
+    ).ask()
+    if finetune_loss is None:
+        finetune_loss = schedule.get("finetune_loss", "cross_entropy")
+    
+    finetune_lr_text = questionary.text(
+        "Finetune learning rate (leave empty to use same as pretrain):",
+        default=str(schedule.get("finetune_lr", "")) if schedule.get("finetune_lr") is not None else "",
+    ).ask()
+    finetune_lr = None
+    if finetune_lr_text and finetune_lr_text.strip():
+        try:
+            finetune_lr = float(finetune_lr_text)
+        except (TypeError, ValueError):
+            finetune_lr = None
+    
+    freeze_backbone = questionary.confirm(
+        "Freeze backbone during finetune (linear evaluation)?",
+        default=schedule.get("freeze_backbone", False),
+    ).ask()
+    if freeze_backbone is None:
+        freeze_backbone = schedule.get("freeze_backbone", False)
+    
+    optimizer_reset = questionary.confirm(
+        "Reset optimizer between phases?",
+        default=schedule.get("optimizer_reset", True),
+    ).ask()
+    if optimizer_reset is None:
+        optimizer_reset = schedule.get("optimizer_reset", True)
+    
+    return {
+        "enabled": enabled,
+        "cycles": cycles_value,
+        "pretrain_epochs": pretrain_value,
+        "finetune_epochs": finetune_value,
+        "pretrain_loss": pretrain_loss,
+        "finetune_loss": finetune_loss,
+        "finetune_lr": finetune_lr,
+        "freeze_backbone": freeze_backbone,
+        "optimizer_reset": optimizer_reset,
+    }
+
+
 def run_config_tui(config_path: str | None = None) -> TrainingConfig:
     """Run the interactive configuration flow and persist the result.
 
@@ -273,6 +357,7 @@ def run_config_tui(config_path: str | None = None) -> TrainingConfig:
     print(f"- gradient_clip_norm: {cfg.gradient_clip_norm}")
     print(f"- mixed_precision: {cfg.mixed_precision}")
     print(f"- report_filename: {cfg.report_filename}")
+    print(f"- simclr_schedule: {cfg.simclr_schedule}")
     print(f"- hyperparameters: {cfg.hyperparameters}")
 
     action = questionary.select(
@@ -352,6 +437,8 @@ def run_config_tui(config_path: str | None = None) -> TrainingConfig:
         "CSV report filename (saved in project root):",
         default=cfg.report_filename,
     ).ask()
+    
+    new_simclr_schedule = _ask_simclr_schedule(cfg.simclr_schedule)
 
     cm.set(
         model=new_model,
@@ -375,6 +462,7 @@ def run_config_tui(config_path: str | None = None) -> TrainingConfig:
             "mode": early_mode,
         },
         report_filename=report_name,
+        simclr_schedule=new_simclr_schedule,
         hyperparameters=new_hp,
     )
     cm.save()

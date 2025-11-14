@@ -92,6 +92,19 @@ class TrainingConfig:
     early_stopping: Dict[str, Any] = field(
         default_factory=lambda: {"enabled": False, "patience": 5, "metric": "val_loss", "mode": "min"}
     )
+    simclr_schedule: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "cycles": 8,
+            "pretrain_epochs": 50,
+            "finetune_epochs": 20,
+            "pretrain_loss": "simclr",
+            "finetune_loss": "cross_entropy",
+            "finetune_lr": None,  # None means use same LR as pretrain
+            "freeze_backbone": False,
+            "optimizer_reset": True,
+        }
+    )
     report_filename: str = "training_report.csv"
     hyperparameters: Dict[str, Any] = field(
         default_factory=lambda: {
@@ -159,6 +172,11 @@ class ConfigManager:
             merged_sched["params"] = {**default_sched_params, **incoming_sched_params}
             merged["scheduler"] = merged_sched
 
+            # Merge nested simclr_schedule while preserving defaults
+            default_schedule = default_dict.get("simclr_schedule", {}) or {}
+            incoming_schedule = merged.get("simclr_schedule") or {}
+            merged["simclr_schedule"] = {**default_schedule, **incoming_schedule}
+
             self._config = TrainingConfig(**merged)
         return self._config
 
@@ -187,6 +205,7 @@ class ConfigManager:
         freeze_backbone: Optional[bool] = None,
         report_filename: Optional[str] = None,
         early_stopping: Optional[Dict[str, Any]] = None,
+        simclr_schedule: Optional[Dict[str, Any]] = None,
         hyperparameters: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Update selected fields in the in-memory configuration.
@@ -230,6 +249,9 @@ class ConfigManager:
             self._config.early_stopping = merged
         if report_filename is not None:
             self._config.report_filename = report_filename
+        if simclr_schedule is not None:
+            merged = {**self._config.simclr_schedule, **simclr_schedule}
+            self._config.simclr_schedule = merged
         if hyperparameters is not None:
             # Update (not replace) to preserve non-provided keys
             self._config.hyperparameters.update(hyperparameters)

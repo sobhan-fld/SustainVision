@@ -1,0 +1,127 @@
+"""Model building utilities."""
+
+from __future__ import annotations
+
+from typing import Tuple
+
+try:
+    from torch import nn
+    import torch.nn.functional as F
+    import torch
+    from torchvision import models as tv_models
+except Exception:
+    nn = None  # type: ignore
+    F = None  # type: ignore
+    torch = None  # type: ignore
+    tv_models = None  # type: ignore
+
+
+class ProjectionModel(nn.Module):  # type: ignore[name-defined]
+    """Wrap a backbone with classification and projection heads."""
+
+    def __init__(
+        self,
+        backbone: nn.Module,
+        feature_dim: int,
+        num_classes: int,
+        projection_dim: int,
+    ) -> None:
+        super().__init__()
+        self.backbone = backbone
+        self.classifier = nn.Linear(feature_dim, num_classes)
+        self.projector = nn.Sequential(
+            nn.Linear(feature_dim, max(feature_dim, projection_dim)),
+            nn.ReLU(),
+            nn.Linear(max(feature_dim, projection_dim), projection_dim),
+        )
+
+    def forward(self, x: "torch.Tensor") -> Tuple["torch.Tensor", "torch.Tensor"]:  # type: ignore[name-defined]
+        """Forward pass returning logits and normalized embeddings."""
+        if torch is None or F is None:
+            raise RuntimeError("PyTorch is required for model forward pass")
+        
+        features = self.backbone(x)
+        if isinstance(features, tuple):
+            features = features[0]
+        if features.ndim > 2:
+            features = torch.flatten(features, 1)
+        logits = self.classifier(features)
+        embeddings = F.normalize(self.projector(features), dim=1) if F is not None else features
+        return logits, embeddings
+
+
+def build_linear_model(
+    num_classes: int,
+    image_size: int,
+    projection_dim: int,
+) -> ProjectionModel:
+    """Build a simple MLP model as fallback."""
+    if nn is None:
+        raise RuntimeError("PyTorch is required for model building")
+    
+    in_features = image_size * image_size * 3
+    feature_dim = 512
+    backbone = nn.Sequential(
+        nn.Flatten(),
+        nn.Linear(in_features, 1024),
+        nn.ReLU(),
+        nn.Linear(1024, feature_dim),
+        nn.ReLU(),
+    )
+    return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+
+
+def build_model(
+    name: str,
+    *,
+    num_classes: int,
+    image_size: int,
+    projection_dim: int,
+) -> nn.Module:
+    """Build a model from name, using torchvision backbones when available."""
+    if nn is None:
+        raise RuntimeError("PyTorch is required for model building")
+    
+    key = (name or "resnet18").lower()
+
+    if tv_models is None:
+        print("[warn] torchvision models unavailable. Using simple MLP classifier.")
+        return build_linear_model(num_classes, image_size, projection_dim)
+
+    try:
+        if key == "resnet18":
+            backbone = tv_models.resnet18(weights=None)
+            feature_dim = backbone.fc.in_features
+            backbone.fc = nn.Identity()
+            return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+        if key == "resnet34":
+            backbone = tv_models.resnet34(weights=None)
+            feature_dim = backbone.fc.in_features
+            backbone.fc = nn.Identity()
+            return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+        if key == "resnet50":
+            backbone = tv_models.resnet50(weights=None)
+            feature_dim = backbone.fc.in_features
+            backbone.fc = nn.Identity()
+            return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+        if key == "mobilenet_v3_small":
+            backbone = tv_models.mobilenet_v3_small(weights=None)
+            feature_dim = backbone.classifier[-1].in_features
+            backbone.classifier[-1] = nn.Identity()
+            return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+        if key == "efficientnet_b0":
+            backbone = tv_models.efficientnet_b0(weights=None)
+            feature_dim = backbone.classifier[-1].in_features
+            backbone.classifier[-1] = nn.Identity()
+            return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+        if key in {"vit_b_16", "vit-b-16", "vit"}:
+            backbone = tv_models.vit_b_16(weights=None)
+            feature_dim = backbone.heads.head.in_features
+            backbone.heads.head = nn.Identity()
+            return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+    except Exception as exc:  # pragma: no cover - model construction safeguard
+        print(f"[warn] Failed to build model '{name}': {exc}. Falling back to MLP classifier.")
+
+    print(f"[warn] Unsupported model '{name}'. Using simple MLP classifier instead.")
+    return build_linear_model(num_classes, image_size, projection_dim)
+
