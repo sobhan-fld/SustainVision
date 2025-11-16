@@ -15,7 +15,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import yaml
 
 from .config import TrainingConfig
-from .training import EpochMetrics, TrainingRunSummary, _execute_training_phase
+from .types import EpochMetrics, TrainingRunSummary
+from .training import _execute_training_phase
 from .utils import unique_report_path
 from .reporting import write_report_csv
 

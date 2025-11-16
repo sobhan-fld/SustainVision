@@ -26,12 +26,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .config import TrainingConfig
 from .data import DatasetPreparationError, build_classification_dataloaders
-from .schedule import run_contrastive_schedule
 from .utils import resolve_device, set_seed, unique_report_path
 from .losses import LossSpec, build_loss, compute_loss
 from .optimizers import build_optimizer, build_scheduler
 from .models import build_model
 from .reporting import write_report_csv
+from .types import EpochMetrics, TrainingRunSummary
 
 
 try:  # Optional imports handled gracefully in `_ensure_dependencies`
@@ -50,29 +50,6 @@ except Exception:  # pragma: no cover - handled at runtime
 
 
 
-@dataclass
-class EpochMetrics:
-    """Container for per-epoch training/validation metrics."""
-
-    epoch: int
-    train_loss: float
-    train_accuracy: float
-    val_loss: float
-    val_accuracy: float
-    learning_rate: float
-    phase: str = "train"
-    loss_name: str = ""
-
-
-@dataclass
-class TrainingRunSummary:
-    """Summary of a training run, including emissions information."""
-
-    report_path: Path
-    emissions_kg: Optional[float]
-    energy_kwh: Optional[float]
-    duration_seconds: Optional[float]
-    epochs: List[EpochMetrics]
 
 
 
@@ -121,7 +98,8 @@ def train_model(
         )
         return summary
     
-    # Run contrastive learning alternating schedule
+    # Run contrastive learning alternating schedule (lazy import to avoid circular dependency)
+    from .schedule import run_contrastive_schedule
     return run_contrastive_schedule(config, project_root=project_root)
 
 

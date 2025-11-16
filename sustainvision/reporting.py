@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .config import TrainingConfig
-from .training import EpochMetrics
+from .types import EpochMetrics
 
 
 def write_report_csv(

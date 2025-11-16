@@ -11,7 +11,8 @@ import questionary
 from sustainvision.config import ConfigManager
 from sustainvision.data import prompt_and_download
 from sustainvision.tui import run_config_tui
-from sustainvision.training import MissingDependencyError, TrainingRunSummary, train_model
+from sustainvision.training import MissingDependencyError, train_model
+from sustainvision.types import TrainingRunSummary
 
 
 def _start_training(cm: ConfigManager) -> None:
