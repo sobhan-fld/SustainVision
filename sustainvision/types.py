@@ -19,6 +19,7 @@ class EpochMetrics:
     learning_rate: float
     phase: str = "train"
     loss_name: str = ""
+    loss_mode: str = ""
 
 
 @dataclass

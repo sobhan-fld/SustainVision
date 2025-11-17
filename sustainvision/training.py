@@ -116,6 +116,7 @@ def _execute_training_phase(
     lr_override: Optional[float] = None,
     freeze_backbone_override: Optional[bool] = None,
     skip_emissions_tracker: bool = False,
+    reset_classifier: bool = False,
 ) -> Tuple[TrainingRunSummary, dict]:
     """Train a toy model using the provided configuration.
 
@@ -197,8 +198,19 @@ def _execute_training_phase(
         else:
             raise MissingDependencyError(f"Checkpoint file not found: {checkpoint_file}")
 
+    if reset_classifier and hasattr(model, "classifier"):
+        classifier = getattr(model, "classifier")
+        if hasattr(classifier, "reset_parameters"):
+            classifier.reset_parameters()  # type: ignore[attr-defined]
+        else:
+            for module in classifier.modules():
+                if hasattr(module, "reset_parameters"):
+                    module.reset_parameters()  # type: ignore[attr-defined]
+        print("[info] Classifier head reset for new evaluation phase.")
+
     freeze_backbone = freeze_backbone_override if freeze_backbone_override is not None else config.freeze_backbone
     if freeze_backbone and hasattr(model, "backbone"):
+        model.backbone.eval()
         for param in model.backbone.parameters():
             param.requires_grad = False
         print("[info] Backbone frozen - only classifier head will be trained")
@@ -361,6 +373,7 @@ def _execute_training_phase(
                     learning_rate=current_lr,
                     phase=phase_label,
                     loss_name=loss_function,
+                    loss_mode=loss_spec.mode,
                 )
             )
 

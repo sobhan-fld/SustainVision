@@ -100,9 +100,12 @@ Training Workflow & Output
     `training_report.csv`).
   - If a file with the same name already exists, an index is appended (e.g.,
     `training_report_1.csv`).
-  - Columns include: epoch, phase (e.g., `pretrain_cycle_1`, `finetune_cycle_1`),
-    train/val loss & accuracy, learning rate, emissions, energy, run duration, and
-    config metadata (model/database/device).
+- Columns now include: epoch, phase (e.g., `pretrain_cycle_1`, `finetune_cycle_1`),
+  `loss_name`, train/val loss & accuracy, learning rate, emissions, energy,
+  run duration, config metadata, plus dedicated views of the current objective:
+  - `contrastive_*` columns are filled only for SimCLR/SupCon epochs
+  - `classifier_*` columns are filled for supervised/finetune epochs
+  - This keeps contrastive metrics visible without confusing them with classifier accuracy.
   - For alternating schedules, all phases are logged in a single CSV with
     continuous epoch numbering and phase labels.
 
@@ -142,6 +145,9 @@ pretrain/finetune cycles:
    - Saves checkpoints after each finetune phase (`_cycle1.pt`, `_cycle2.pt`, ...)
    - Continues epoch numbering across all phases
    - Tracks emissions for the entire run
+- When `freeze_backbone: true`, the classifier head is re-initialized before each
+  finetune phase, mirroring the “train backbone → train linear head” procedure
+  recommended in SimCLR/SupCon workflows.
 
 **Example configuration**:
 ```yaml

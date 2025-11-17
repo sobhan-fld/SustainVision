@@ -136,6 +136,7 @@ def _run_finetune_phase(
         lr_override=params["finetune_lr"],
         freeze_backbone_override=params["freeze_backbone"],
         skip_emissions_tracker=True,
+        reset_classifier=params["freeze_backbone"],
     )
     return summary, state
 

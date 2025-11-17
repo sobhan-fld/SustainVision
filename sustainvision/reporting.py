@@ -24,12 +24,16 @@ def write_report_csv(
     fieldnames = [
         "epoch",
         "phase",
+        "loss_name",
         "train_loss",
         "train_accuracy",
         "val_loss",
         "val_accuracy",
         "learning_rate",
-        "loss_function",
+        "contrastive_train_loss",
+        "contrastive_val_loss",
+        "classifier_train_loss",
+        "classifier_val_loss",
         "emissions_kg",
         "energy_kwh",
         "duration_seconds",
@@ -54,30 +58,45 @@ def write_report_csv(
         if not (append and file_exists):
             writer.writeheader()
         for metrics in epochs:
-            writer.writerow(
-                {
-                    "epoch": metrics.epoch,
-                    "phase": metrics.phase,
-                    "train_loss": f"{metrics.train_loss:.6f}",
-                    "train_accuracy": f"{metrics.train_accuracy:.6f}",
-                    "val_loss": f"{metrics.val_loss:.6f}",
-                    "val_accuracy": f"{metrics.val_accuracy:.6f}",
-                    "learning_rate": f"{metrics.learning_rate:.6f}",
-                    "loss_function": metrics.loss_name or config.loss_function,
-                    "emissions_kg": "",
-                    "energy_kwh": "",
-                    "duration_seconds": "",
-                    "model": config.model,
-                    "database": config.database,
-                    "device": config.device,
-                    "optimizer": config.optimizer,
-                    "loss_function": config.loss_function,
-                    "weight_decay": config.weight_decay,
-                    "scheduler": config.scheduler,
-                    "seed": config.seed,
-                    "temperature": config.hyperparameters.get("temperature"),
-                }
-            )
+            loss_name = metrics.loss_name or config.loss_function
+            loss_mode = (metrics.loss_mode or "").lower()
+            is_contrastive = loss_mode in {"simclr", "supcon"} or loss_name.lower() in {"simclr", "supcon"}
+
+            row = {
+                "epoch": metrics.epoch,
+                "phase": metrics.phase,
+                "loss_name": loss_name,
+                "train_loss": f"{metrics.train_loss:.6f}",
+                "train_accuracy": f"{metrics.train_accuracy:.6f}",
+                "val_loss": f"{metrics.val_loss:.6f}",
+                "val_accuracy": f"{metrics.val_accuracy:.6f}",
+                "learning_rate": f"{metrics.learning_rate:.6f}",
+                "contrastive_train_loss": "",
+                "contrastive_val_loss": "",
+                "classifier_train_loss": "",
+                "classifier_val_loss": "",
+                "emissions_kg": "",
+                "energy_kwh": "",
+                "duration_seconds": "",
+                "model": config.model,
+                "database": config.database,
+                "device": config.device,
+                "optimizer": config.optimizer,
+                "loss_function": config.loss_function,
+                "weight_decay": config.weight_decay,
+                "scheduler": config.scheduler,
+                "seed": config.seed,
+                "temperature": config.hyperparameters.get("temperature"),
+            }
+
+            if is_contrastive:
+                row["contrastive_train_loss"] = f"{metrics.train_loss:.6f}"
+                row["contrastive_val_loss"] = f"{metrics.val_loss:.6f}"
+            else:
+                row["classifier_train_loss"] = f"{metrics.train_loss:.6f}"
+                row["classifier_val_loss"] = f"{metrics.val_loss:.6f}"
+
+            writer.writerow(row)
         
         # Only write summary row if not appending (summary written at end of all phases)
         if not append:
@@ -85,11 +104,16 @@ def write_report_csv(
                 {
                     "epoch": "summary",
                     "phase": "summary",
+                    "loss_name": "",
                     "train_loss": "",
                     "train_accuracy": "",
                     "val_loss": "",
                     "val_accuracy": "",
                     "learning_rate": f"{last_lr:.6f}" if last_lr is not None else "",
+                    "contrastive_train_loss": "",
+                    "contrastive_val_loss": "",
+                    "classifier_train_loss": "",
+                    "classifier_val_loss": "",
                     "loss_function": config.loss_function,
                     "emissions_kg": f"{emissions_kg:.6f}" if emissions_kg is not None else "",
                     "energy_kwh": f"{energy_kwh:.6f}" if energy_kwh is not None else "",
