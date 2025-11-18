@@ -18,6 +18,9 @@ from typing import Any, Dict, List, Optional
 import yaml
 
 
+_UNSET = object()
+
+
 def _default_config_path() -> str:
     """Return the default path for the YAML configuration file.
 
@@ -200,7 +203,7 @@ class ConfigManager:
         loss_function: Optional[str] = None,
         weight_decay: Optional[float] = None,
         scheduler: Optional[Dict[str, Any]] = None,
-        gradient_clip_norm: Optional[float] = None,
+        gradient_clip_norm: Any = _UNSET,
         mixed_precision: Optional[bool] = None,
         save_model: Optional[bool] = None,
         save_model_path: Optional[str] = None,
@@ -230,12 +233,30 @@ class ConfigManager:
         if weight_decay is not None:
             self._config.weight_decay = float(weight_decay)
         if scheduler is not None:
-            sched = {**self._config.scheduler, **scheduler}
-            default_params = self._config.scheduler.get("params", {}) if isinstance(self._config.scheduler, dict) else {}
-            incoming_params = scheduler.get("params", {}) if isinstance(scheduler, dict) else {}
-            sched["params"] = {**default_params, **incoming_params}
+            current_sched = self._config.scheduler if isinstance(self._config.scheduler, dict) else {}
+            current_type = current_sched.get("type")
+            incoming_type = scheduler.get("type") if isinstance(scheduler, dict) else None
+            incoming_params_present = isinstance(scheduler, dict) and "params" in scheduler
+            base_params = current_sched.get("params", {}) if isinstance(current_sched.get("params"), dict) else {}
+            incoming_params = scheduler.get("params", {}) if incoming_params_present else {}
+
+            if incoming_type and incoming_type != current_type:
+                base_sched = {"type": incoming_type}
+            else:
+                base_sched = {**current_sched}
+
+            sched = {**base_sched, **scheduler}
+
+            if incoming_params_present:
+                merged_params = dict(incoming_params or {})
+            elif incoming_type and incoming_type != current_type:
+                merged_params = {}
+            else:
+                merged_params = dict(base_params)
+
+            sched["params"] = merged_params
             self._config.scheduler = sched
-        if gradient_clip_norm is not None:
+        if gradient_clip_norm is not _UNSET:
             self._config.gradient_clip_norm = gradient_clip_norm
         if mixed_precision is not None:
             self._config.mixed_precision = bool(mixed_precision)
