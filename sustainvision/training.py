@@ -151,6 +151,9 @@ def _execute_training_phase(
     val_split = float(config.hyperparameters.get("val_split", 0.1))
     image_size = int(config.hyperparameters.get("image_size", 224))
     projection_dim = int(config.hyperparameters.get("projection_dim", 128))
+    lars_eta = float(config.hyperparameters.get("lars_eta", 0.001))
+    lars_eps = float(config.hyperparameters.get("lars_eps", 1e-9))
+    lars_exclude_bias_n_norm = bool(config.hyperparameters.get("lars_exclude_bias_n_norm", True))
 
     loss_function = loss_function_override if loss_function_override is not None else config.loss_function
     loss_spec = build_loss(loss_function)
@@ -230,6 +233,9 @@ def _execute_training_phase(
         lr=learning_rate,
         weight_decay=config.weight_decay,
         momentum=momentum,
+        lars_eta=lars_eta,
+        lars_eps=lars_eps,
+        lars_exclude_bias_n_norm=lars_exclude_bias_n_norm,
     )
     scheduler = build_scheduler(config.scheduler, optimizer)
 

@@ -213,6 +213,7 @@ Configuration Reference
   - `lr`
   - `epochs`
   - `momentum`
+  - `lars_eta`, `lars_eps`, `lars_exclude_bias_n_norm` (only used when `optimizer="lars"`)
   - `temperature`
   - `num_workers`
   - `val_split`
@@ -236,7 +237,7 @@ Available Options Cheat Sheet
 - `simclr`, `supcon` (contrastive)
 
 **Optimizers**
-- `adam`, `adamw`, `sgd`, `rmsprop`, `lion`
+- `adam`, `adamw`, `sgd`, `rmsprop`, `lion`, `lars`
 - Custom strings fall back to Adam
 
 **Schedulers**

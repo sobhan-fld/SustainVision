@@ -120,7 +120,7 @@ def _ask_seed(current: int) -> int:
 
 
 def _ask_optimizer(current: str) -> str:
-    options = ["adam", "adamw", "sgd", "rmsprop", "lion", "custom"]
+    options = ["adam", "adamw", "sgd", "rmsprop", "lion", "lars", "custom"]
     choice = questionary.select(
         "Optimizer:",
         choices=options,

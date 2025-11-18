@@ -117,6 +117,9 @@ class TrainingConfig:
             "val_split": 0.1,
             "image_size": 224,
             "projection_dim": 128,
+            "lars_eta": 0.001,
+            "lars_eps": 1e-9,
+            "lars_exclude_bias_n_norm": True,
         }
     )
 
