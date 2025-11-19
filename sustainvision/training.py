@@ -167,7 +167,8 @@ def _execute_training_phase(
 
     loss_function = loss_function_override if loss_function_override is not None else config.loss_function
     loss_spec = build_loss(loss_function)
-    contrastive_mode = loss_spec.mode != "logits"
+    contrastive_mode = loss_spec.mode in {"simclr", "supcon"}
+    classification_mode = not contrastive_mode
 
     try:
         train_loader, val_loader, num_classes = build_classification_dataloaders(
@@ -316,9 +317,9 @@ def _execute_training_phase(
         for epoch in epoch_iterable:
             model.train()
             epoch_loss = 0.0
+            loss_normalizer = 0.0
             correct = 0
             total = 0
-            epoch_samples = 0
 
             batch_iterable = train_loader
             if use_tqdm:
@@ -362,9 +363,10 @@ def _execute_training_phase(
                         torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
                     optimizer.step()
 
-                epoch_loss += loss.item() * inputs.size(0)
-                epoch_samples += inputs.size(0)
-                if not contrastive_mode:
+                batch_weight = float(inputs.size(0)) if contrastive_mode else 1.0
+                epoch_loss += loss.item() * batch_weight
+                loss_normalizer += batch_weight
+                if classification_mode:
                     preds = logits.argmax(dim=1)
                     correct += (preds == labels).sum().item()
                     total += labels.size(0)
@@ -375,14 +377,14 @@ def _execute_training_phase(
                 except Exception:
                     pass
 
-            train_loss = epoch_loss / max(epoch_samples, 1)
+            train_loss = epoch_loss / max(loss_normalizer, 1.0)
             train_acc = correct / total if total else 0.0
 
             model.eval()
             val_loss_accum = 0.0
+            val_loss_normalizer = 0.0
             val_correct = 0
             val_total = 0
-            val_samples = 0
             with torch.no_grad():
                 for inputs, labels in val_loader:
                     if contrastive_mode and isinstance(inputs, (list, tuple)):
@@ -396,14 +398,15 @@ def _execute_training_phase(
                     labels = labels.to(device)
                     logits, embeddings = model(inputs)
                     loss = compute_loss(loss_spec, logits, embeddings, labels, temperature)
-                    val_loss_accum += loss.item() * inputs.size(0)
-                    val_samples += inputs.size(0)
-                    if not contrastive_mode:
+                    batch_weight = float(inputs.size(0)) if contrastive_mode else 1.0
+                    val_loss_accum += loss.item() * batch_weight
+                    val_loss_normalizer += batch_weight
+                    if classification_mode:
                         preds = logits.argmax(dim=1)
                         val_correct += (preds == labels).sum().item()
                         val_total += labels.size(0)
 
-            val_loss = val_loss_accum / max(val_samples, 1)
+            val_loss = val_loss_accum / max(val_loss_normalizer, 1.0)
             val_acc = val_correct / val_total if val_total else 0.0
             current_lr = optimizer.param_groups[0].get("lr", 0.0)
 

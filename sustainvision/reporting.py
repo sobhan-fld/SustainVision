@@ -86,7 +86,7 @@ def write_report_csv(
                 "database": config.database,
                 "device": config.device,
                 "optimizer": optimizer_name,
-                "loss_function": config.loss_function,
+                "loss_function": loss_name,
                 "weight_decay": row_weight_decay,
                 "scheduler": config.scheduler,
                 "seed": config.seed,
