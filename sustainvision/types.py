@@ -21,6 +21,7 @@ class EpochMetrics:
     loss_name: str = ""
     loss_mode: str = ""
     optimizer_name: str = ""
+    weight_decay: Optional[float] = None
     projector_hidden_dim: Optional[int] = None
 
 

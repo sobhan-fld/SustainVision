@@ -85,27 +85,26 @@ def compute_loss(
 
 
 def simclr_loss(embeddings: "torch.Tensor", temperature: float) -> "torch.Tensor":  # type: ignore[name-defined]
-    """Compute SimCLR contrastive loss."""
+    """Compute SimCLR contrastive loss using two augmented views per sample."""
     if torch is None or F is None:
         raise RuntimeError("PyTorch is required for SimCLR loss")
     
-    batch_size = embeddings.size(0)
-    if batch_size < 2:
+    if embeddings.size(0) % 2 != 0:
+        raise ValueError("SimCLR embeddings must contain an even number of samples (two views per item).")
+
+    batch_size = embeddings.size(0) // 2
+    if batch_size == 0:
         return embeddings.new_zeros(())
 
-    noise = torch.randn_like(embeddings) * 0.01
-    z1 = F.normalize(embeddings + noise, dim=1)
-    z2 = F.normalize(embeddings - noise, dim=1)
-    representations = torch.cat([z1, z2], dim=0)
-
-    logits = torch.matmul(representations, representations.T) / max(temperature, 1e-6)
+    representations = F.normalize(embeddings, dim=1)
+    similarity_matrix = torch.matmul(representations, representations.T) / max(temperature, 1e-6)
     mask = torch.eye(2 * batch_size, device=embeddings.device, dtype=torch.bool)
-    logits = logits.masked_fill(mask, -1e9)
+    similarity_matrix = similarity_matrix.masked_fill(mask, -1e9)
 
     targets = torch.arange(2 * batch_size, device=embeddings.device)
     targets = (targets + batch_size) % (2 * batch_size)
 
-    return F.cross_entropy(logits, targets)
+    return F.cross_entropy(similarity_matrix, targets)
 
 
 def supcon_loss(
@@ -113,36 +112,42 @@ def supcon_loss(
     labels: "torch.Tensor",
     temperature: float,
 ) -> "torch.Tensor":  # type: ignore[name-defined]
-    """Compute Supervised Contrastive (SupCon) loss."""
-    if torch is None:
+    """Compute Supervised Contrastive (SupCon) loss with two views per sample."""
+    if torch is None or F is None:
         raise RuntimeError("PyTorch is required for SupCon loss")
     
-    device = embeddings.device
-    labels = labels.contiguous().view(-1, 1)
-    batch_size = embeddings.size(0)
+    if embeddings.size(0) % 2 != 0:
+        raise ValueError("SupCon embeddings must contain an even number of samples (two views per item).")
 
-    if batch_size < 2:
+    device = embeddings.device
+    n_views = 2
+    batch_size = embeddings.size(0) // n_views
+    if batch_size == 0:
         return embeddings.new_zeros(())
 
-    mask = torch.eq(labels, labels.T).float().to(device)
-    anchor_dot_contrast = torch.div(
-        torch.matmul(embeddings, embeddings.T),
-        max(temperature, 1e-6),
-    )
+    features = embeddings.view(batch_size, n_views, -1)
+    features = F.normalize(features, dim=2)
 
-    # For numerical stability
-    logits_max, _ = anchor_dot_contrast.max(dim=1, keepdim=True)
-    logits = anchor_dot_contrast - logits_max.detach()
+    labels = labels.view(batch_size, n_views)[:, 0]
+    mask = torch.eq(labels.unsqueeze(1), labels.unsqueeze(0)).float().to(device)
 
-    logits_mask = torch.ones_like(mask) - torch.eye(batch_size, device=device)
-    mask = mask * logits_mask
+    contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
+    anchor_feature = contrast_feature
+    anchor_count = n_views
 
+    logits = torch.matmul(anchor_feature, contrast_feature.T) / max(temperature, 1e-6)
+    logits_mask = torch.ones_like(logits, device=device)
+    logits_mask = logits_mask - torch.eye(batch_size * n_views, device=device)
+    mask = mask.repeat(anchor_count, n_views)
+
+    logits = logits * logits_mask
     exp_logits = torch.exp(logits) * logits_mask
-    log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-12)
 
+    log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-12)
     mask_sum = mask.sum(dim=1)
     mean_log_prob_pos = (mask * log_prob).sum(dim=1) / torch.clamp(mask_sum, min=1.0)
 
-    loss = -temperature * mean_log_prob_pos
-    return loss.mean()
+    loss = -mean_log_prob_pos
+    loss = loss.view(anchor_count, batch_size).mean()
+    return loss
 

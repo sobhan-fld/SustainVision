@@ -62,6 +62,9 @@ def write_report_csv(
             loss_mode = (metrics.loss_mode or "").lower()
             is_contrastive = loss_mode in {"simclr", "supcon"} or loss_name.lower() in {"simclr", "supcon"}
             optimizer_name = metrics.optimizer_name or config.optimizer
+            row_weight_decay = (
+                metrics.weight_decay if metrics.weight_decay is not None else config.weight_decay
+            )
 
             row = {
                 "epoch": metrics.epoch,
@@ -84,7 +87,7 @@ def write_report_csv(
                 "device": config.device,
                 "optimizer": optimizer_name,
                 "loss_function": config.loss_function,
-                "weight_decay": config.weight_decay,
+                "weight_decay": row_weight_decay,
                 "scheduler": config.scheduler,
                 "seed": config.seed,
                 "temperature": config.hyperparameters.get("temperature"),
@@ -102,8 +105,11 @@ def write_report_csv(
         # Only write summary row if not appending (summary written at end of all phases)
         if not append:
             summary_optimizer = config.optimizer
+            summary_weight_decay = config.weight_decay
             if epochs:
                 summary_optimizer = epochs[-1].optimizer_name or config.optimizer
+                if epochs[-1].weight_decay is not None:
+                    summary_weight_decay = epochs[-1].weight_decay
             writer.writerow(
                 {
                     "epoch": "summary",
@@ -127,7 +133,7 @@ def write_report_csv(
                     "device": config.device,
                     "optimizer": summary_optimizer,
                     "loss_function": config.loss_function,
-                    "weight_decay": config.weight_decay,
+                    "weight_decay": summary_weight_decay,
                     "scheduler": config.scheduler,
                     "seed": config.seed,
                     "temperature": config.hyperparameters.get("temperature"),

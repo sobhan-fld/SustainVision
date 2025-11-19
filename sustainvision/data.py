@@ -242,20 +242,40 @@ def build_classification_dataloaders(
 
     generator = torch.Generator().manual_seed(seed)
 
+    def _wrap_contrastive(dataset, transform):
+        class _ContrastiveDataset(torch.utils.data.Dataset):  # type: ignore[attr-defined]
+            def __init__(self, base_ds, aug):
+                self.base_ds = base_ds
+                self.aug = aug
+
+            def __len__(self):
+                return len(self.base_ds)
+
+            def __getitem__(self, idx):
+                image, target = self.base_ds[idx]
+                view1 = self.aug(image)
+                view2 = self.aug(image)
+                return (view1, view2), target
+
+        return _ContrastiveDataset(dataset, transform)
+
     if dataset_kind == "cifar10":
+        train_transform = _base_transforms(train=True)
+        cifar_train_transform = None if contrastive else train_transform
         train_base = tv_datasets.CIFAR10(
             root=str(dataset_path),
             train=True,
-            transform=_base_transforms(train=True),
+            transform=cifar_train_transform,
             download=False,
         )
         num_classes = 10
 
         if val_split > 0:
+            val_transform = _base_transforms(train=True if contrastive else False)
             val_base = tv_datasets.CIFAR10(
                 root=str(dataset_path),
                 train=True,
-                transform=_base_transforms(train=False),
+                transform=None if contrastive else _base_transforms(train=False),
                 download=False,
             )
             total = len(train_base)
@@ -271,15 +291,21 @@ def build_classification_dataloaders(
             val_dataset = tv_datasets.CIFAR10(
                 root=str(dataset_path),
                 train=False,
-                transform=_base_transforms(train=False),
+                transform=None if contrastive else _base_transforms(train=False),
                 download=False,
             )
 
+        if contrastive:
+            train_dataset = _wrap_contrastive(train_dataset, train_transform)
+            val_dataset = _wrap_contrastive(val_dataset, train_transform)
+
     elif dataset_kind == "mnist":
+        train_transform = _base_transforms(train=True)
+        mnist_train_transform = None if contrastive else train_transform
         train_base = tv_datasets.MNIST(
             root=str(dataset_path),
             train=True,
-            transform=_base_transforms(train=True),
+            transform=mnist_train_transform,
             download=False,
         )
         num_classes = 10
@@ -288,7 +314,7 @@ def build_classification_dataloaders(
             val_base = tv_datasets.MNIST(
                 root=str(dataset_path),
                 train=True,
-                transform=_base_transforms(train=False),
+                transform=None if contrastive else _base_transforms(train=False),
                 download=False,
             )
             total = len(train_base)
@@ -304,9 +330,13 @@ def build_classification_dataloaders(
             val_dataset = tv_datasets.MNIST(
                 root=str(dataset_path),
                 train=False,
-                transform=_base_transforms(train=False),
+                transform=None if contrastive else _base_transforms(train=False),
                 download=False,
             )
+
+        if contrastive:
+            train_dataset = _wrap_contrastive(train_dataset, train_transform)
+            val_dataset = _wrap_contrastive(val_dataset, train_transform)
 
     else:  # imagefolder or custom dataset
         try:
@@ -321,19 +351,22 @@ def build_classification_dataloaders(
         if not train_dir.exists():
             train_dir = dataset_path
 
-        train_base = img_datasets.ImageFolder(train_dir)
-        train_base.transform = _base_transforms(train=True)
+        train_base = img_datasets.ImageFolder(train_dir, transform=None)
+        train_transform = _base_transforms(train=True)
+        if not contrastive:
+            train_base.transform = train_transform
         num_classes = len(train_base.classes)
 
+        eval_transform = None if contrastive else _base_transforms(train=False)
         if val_dir.exists():
-            val_dataset = img_datasets.ImageFolder(val_dir, transform=_base_transforms(train=False))
+            val_dataset = img_datasets.ImageFolder(val_dir, transform=eval_transform)
             train_dataset = train_base
         elif test_dir.exists():
-            val_dataset = img_datasets.ImageFolder(test_dir, transform=_base_transforms(train=False))
+            val_dataset = img_datasets.ImageFolder(test_dir, transform=eval_transform)
             train_dataset = train_base
         elif val_split > 0:
             val_base = img_datasets.ImageFolder(train_dir)
-            val_base.transform = _base_transforms(train=False)
+            val_base.transform = eval_transform
             total = len(train_base)
             val_count = max(1, int(total * val_split))
             train_count = total - val_count
@@ -346,6 +379,10 @@ def build_classification_dataloaders(
             raise DatasetPreparationError(
                 "Validation data not found. Provide a 'val' or 'test' directory, or set val_split > 0."
             )
+
+        if contrastive:
+            train_dataset = _wrap_contrastive(train_dataset, train_transform)
+            val_dataset = _wrap_contrastive(val_dataset, train_transform)
 
     train_loader = DataLoader(
         train_dataset,

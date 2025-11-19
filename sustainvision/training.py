@@ -179,7 +179,7 @@ def _execute_training_phase(
             project_root=project_dir,
             image_size=image_size,
             contrastive=contrastive_mode,
-            use_gaussian_blur=use_gaussian_blur,
+            use_gaussian_blur=use_gaussian_blur if contrastive_mode else False,
         )
     except DatasetPreparationError as exc:
         raise MissingDependencyError(str(exc)) from exc
@@ -318,6 +318,7 @@ def _execute_training_phase(
             epoch_loss = 0.0
             correct = 0
             total = 0
+            epoch_samples = 0
 
             batch_iterable = train_loader
             if use_tqdm:
@@ -331,6 +332,13 @@ def _execute_training_phase(
                 )
 
             for inputs, labels in batch_iterable:
+                if contrastive_mode and isinstance(inputs, (list, tuple)):
+                    if len(inputs) != 2:
+                        raise ValueError("Contrastive batches must provide two augmented views.")
+                    view1, view2 = inputs
+                    inputs = torch.cat([view1, view2], dim=0)
+                    if loss_spec.mode == "supcon":
+                        labels = torch.cat([labels, labels], dim=0)
                 inputs = inputs.to(device)
                 labels = labels.to(device)
 
@@ -355,9 +363,11 @@ def _execute_training_phase(
                     optimizer.step()
 
                 epoch_loss += loss.item() * inputs.size(0)
-                preds = logits.argmax(dim=1)
-                correct += (preds == labels).sum().item()
-                total += labels.size(0)
+                epoch_samples += inputs.size(0)
+                if not contrastive_mode:
+                    preds = logits.argmax(dim=1)
+                    correct += (preds == labels).sum().item()
+                    total += labels.size(0)
 
             if use_tqdm:
                 try:
@@ -365,25 +375,35 @@ def _execute_training_phase(
                 except Exception:
                     pass
 
-            train_loss = epoch_loss / total
+            train_loss = epoch_loss / max(epoch_samples, 1)
             train_acc = correct / total if total else 0.0
 
             model.eval()
             val_loss_accum = 0.0
             val_correct = 0
             val_total = 0
+            val_samples = 0
             with torch.no_grad():
                 for inputs, labels in val_loader:
+                    if contrastive_mode and isinstance(inputs, (list, tuple)):
+                        if len(inputs) != 2:
+                            raise ValueError("Contrastive batches must provide two augmented views.")
+                        view1, view2 = inputs
+                        inputs = torch.cat([view1, view2], dim=0)
+                        if loss_spec.mode == "supcon":
+                            labels = torch.cat([labels, labels], dim=0)
                     inputs = inputs.to(device)
                     labels = labels.to(device)
                     logits, embeddings = model(inputs)
                     loss = compute_loss(loss_spec, logits, embeddings, labels, temperature)
                     val_loss_accum += loss.item() * inputs.size(0)
-                    preds = logits.argmax(dim=1)
-                    val_correct += (preds == labels).sum().item()
-                    val_total += labels.size(0)
+                    val_samples += inputs.size(0)
+                    if not contrastive_mode:
+                        preds = logits.argmax(dim=1)
+                        val_correct += (preds == labels).sum().item()
+                        val_total += labels.size(0)
 
-            val_loss = val_loss_accum / val_total if val_total else 0.0
+            val_loss = val_loss_accum / max(val_samples, 1)
             val_acc = val_correct / val_total if val_total else 0.0
             current_lr = optimizer.param_groups[0].get("lr", 0.0)
 
@@ -399,6 +419,7 @@ def _execute_training_phase(
                     loss_name=loss_function,
                     loss_mode=loss_spec.mode,
                     optimizer_name=optimizer_name,
+                    weight_decay=weight_decay_value,
                 )
             )
 
