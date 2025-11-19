@@ -114,6 +114,8 @@ def _execute_training_phase(
     loss_function_override: Optional[str] = None,
     epochs_override: Optional[int] = None,
     lr_override: Optional[float] = None,
+    optimizer_override: Optional[str] = None,
+    weight_decay_override: Optional[float] = None,
     freeze_backbone_override: Optional[bool] = None,
     skip_emissions_tracker: bool = False,
     reset_classifier: bool = False,
@@ -151,6 +153,14 @@ def _execute_training_phase(
     val_split = float(config.hyperparameters.get("val_split", 0.1))
     image_size = int(config.hyperparameters.get("image_size", 224))
     projection_dim = int(config.hyperparameters.get("projection_dim", 128))
+    projection_hidden_raw = config.hyperparameters.get("projection_hidden_dim")
+    projection_hidden_dim = (
+        int(projection_hidden_raw)
+        if projection_hidden_raw not in (None, "", "none")
+        else None
+    )
+    projection_use_bn = bool(config.hyperparameters.get("projection_use_bn", False))
+    use_gaussian_blur = bool(config.hyperparameters.get("use_gaussian_blur", False))
     lars_eta = float(config.hyperparameters.get("lars_eta", 0.001))
     lars_eps = float(config.hyperparameters.get("lars_eps", 1e-9))
     lars_exclude_bias_n_norm = bool(config.hyperparameters.get("lars_exclude_bias_n_norm", True))
@@ -169,6 +179,7 @@ def _execute_training_phase(
             project_root=project_dir,
             image_size=image_size,
             contrastive=contrastive_mode,
+            use_gaussian_blur=use_gaussian_blur,
         )
     except DatasetPreparationError as exc:
         raise MissingDependencyError(str(exc)) from exc
@@ -178,6 +189,8 @@ def _execute_training_phase(
         num_classes=num_classes,
         image_size=image_size,
         projection_dim=projection_dim,
+        projection_hidden_dim=projection_hidden_dim,
+        projection_use_bn=projection_use_bn,
     ).to(device)
 
     if initial_state is not None:
@@ -227,11 +240,16 @@ def _execute_training_phase(
         print("[info] Training on device: unknown (model has no parameters)")
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer_name = optimizer_override if optimizer_override else config.optimizer
+    weight_decay_value = (
+        config.weight_decay if weight_decay_override is None else float(weight_decay_override)
+    )
+
     optimizer = build_optimizer(
-        config.optimizer,
+        optimizer_name,
         trainable_params,
         lr=learning_rate,
-        weight_decay=config.weight_decay,
+        weight_decay=weight_decay_value,
         momentum=momentum,
         lars_eta=lars_eta,
         lars_eps=lars_eps,
@@ -380,6 +398,7 @@ def _execute_training_phase(
                     phase=phase_label,
                     loss_name=loss_function,
                     loss_mode=loss_spec.mode,
+                    optimizer_name=optimizer_name,
                 )
             )
 

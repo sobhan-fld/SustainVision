@@ -173,6 +173,7 @@ def build_classification_dataloaders(
     project_root: Optional[Path] = None,
     image_size: int = 224,
     contrastive: bool = False,
+    use_gaussian_blur: bool = False,
 ) -> Tuple["DataLoader", "DataLoader", int]:  # type: ignore[name-defined]
     """Create train/val dataloaders for common classification datasets."""
 
@@ -223,6 +224,11 @@ def build_classification_dataloaders(
                         transforms.RandomGrayscale(p=0.2),
                     ]
                 )
+                if use_gaussian_blur:
+                    kernel_size = int(0.1 * image_size)
+                    kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+                    kernel_size = max(kernel_size, 3)
+                    ops.append(transforms.GaussianBlur(kernel_size=kernel_size, sigma=(0.1, 2.0)))
         else:
             ops.extend(
                 [

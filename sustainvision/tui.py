@@ -85,6 +85,18 @@ def _ask_hyperparameters(hp: Dict[str, Any]) -> Dict[str, Any]:
         "projection head dimension:",
         default=str(hp.get("projection_dim", 128)),
     ).ask()
+    projection_hidden_dim = questionary.text(
+        "projection hidden dimension (enter 'none' for default):",
+        default=str(hp.get("projection_hidden_dim", "none")),
+    ).ask()
+    use_bn_projection = questionary.confirm(
+        "Use BatchNorm in projection head?",
+        default=bool(hp.get("projection_use_bn", False)),
+    ).ask()
+    use_gaussian_blur = questionary.confirm(
+        "Add Gaussian blur to contrastive augmentations?",
+        default=bool(hp.get("use_gaussian_blur", False)),
+    ).ask()
 
     def as_int(value: str, default: int) -> int:
         try:
@@ -108,6 +120,11 @@ def _ask_hyperparameters(hp: Dict[str, Any]) -> Dict[str, Any]:
         "val_split": as_float(val_split, hp.get("val_split", 0.1)),
         "image_size": as_int(image_size, hp.get("image_size", 224)),
         "projection_dim": as_int(projection_dim, hp.get("projection_dim", 128)),
+        "projection_hidden_dim": None
+        if projection_hidden_dim is None or str(projection_hidden_dim).strip().lower() in {"", "none"}
+        else as_int(projection_hidden_dim, hp.get("projection_hidden_dim", 0) or 0),
+        "projection_use_bn": bool(use_bn_projection),
+        "use_gaussian_blur": bool(use_gaussian_blur),
     }
 
 
@@ -309,6 +326,35 @@ def _ask_simclr_schedule(schedule: Dict[str, Any]) -> Dict[str, Any]:
         except (TypeError, ValueError):
             finetune_lr = None
     
+    finetune_optimizer = questionary.select(
+        "Finetune optimizer (linear head):",
+        choices=["inherit"] + ["adam", "adamw", "sgd", "rmsprop", "lion", "lars"],
+        default=schedule.get("finetune_optimizer", None) or "inherit",
+    ).ask()
+    if finetune_optimizer in ("inherit", None):
+        finetune_optimizer = None
+    
+    finetune_weight_decay_text = questionary.text(
+        "Finetune weight decay (enter 'inherit' to reuse main setting):",
+        default=(
+            str(schedule.get("finetune_weight_decay", "inherit"))
+            if schedule.get("finetune_weight_decay") is not None
+            else "inherit"
+        ),
+    ).ask()
+    finetune_weight_decay: Optional[float] = None
+    if finetune_weight_decay_text:
+        finetune_weight_decay_text = finetune_weight_decay_text.strip().lower()
+        if finetune_weight_decay_text not in {"inherit", "none", ""}:
+            try:
+                finetune_weight_decay = float(finetune_weight_decay_text)
+            except (TypeError, ValueError):
+                finetune_weight_decay = schedule.get("finetune_weight_decay")
+        elif finetune_weight_decay_text in {"none", ""}:
+            finetune_weight_decay = 0.0
+        else:
+            finetune_weight_decay = None
+    
     freeze_backbone = questionary.confirm(
         "Freeze backbone during finetune (linear evaluation)?",
         default=schedule.get("freeze_backbone", False),
@@ -331,6 +377,8 @@ def _ask_simclr_schedule(schedule: Dict[str, Any]) -> Dict[str, Any]:
         "pretrain_loss": pretrain_loss,
         "finetune_loss": finetune_loss,
         "finetune_lr": finetune_lr,
+        "finetune_optimizer": finetune_optimizer,
+        "finetune_weight_decay": finetune_weight_decay,
         "freeze_backbone": freeze_backbone,
         "optimizer_reset": optimizer_reset,
     }
@@ -408,31 +456,40 @@ def run_config_tui(config_path: str | None = None) -> TrainingConfig:
         ).ask()
         if freeze_backbone is None:
             freeze_backbone = cfg.freeze_backbone
+    early_defaults = cfg.early_stopping or {}
     early_enabled = questionary.confirm(
         "Enable early stopping?",
-        default=cfg.early_stopping.get("enabled", False),
+        default=early_defaults.get("enabled", False),
     ).ask()
     if early_enabled is None:
-        early_enabled = cfg.early_stopping.get("enabled", False)
-    early_patience = questionary.text(
-        "Early stopping patience (epochs):",
-        default=str(cfg.early_stopping.get("patience", 5)),
-    ).ask()
-    patience_value = _safe_positive_int(early_patience, cfg.early_stopping.get("patience", 5))
-    early_metric = questionary.select(
-        "Monitor metric:",
-        choices=["val_loss", "val_accuracy", "train_loss", "train_accuracy"],
-        default=cfg.early_stopping.get("metric", "val_loss"),
-    ).ask()
-    if early_metric is None:
-        early_metric = cfg.early_stopping.get("metric", "val_loss")
-    early_mode = questionary.select(
-        "Early stopping mode:",
-        choices=["min", "max"],
-        default=cfg.early_stopping.get("mode", "min"),
-    ).ask()
-    if early_mode is None:
-        early_mode = cfg.early_stopping.get("mode", "min")
+        early_enabled = early_defaults.get("enabled", False)
+
+    patience_value = early_defaults.get("patience", 5)
+    early_metric = early_defaults.get("metric", "val_loss")
+    early_mode = early_defaults.get("mode", "min")
+
+    if early_enabled:
+        early_patience = questionary.text(
+            "Early stopping patience (epochs):",
+            default=str(early_defaults.get("patience", 5)),
+        ).ask()
+        patience_value = _safe_positive_int(early_patience, early_defaults.get("patience", 5))
+
+        metric_answer = questionary.select(
+            "Monitor metric:",
+            choices=["val_loss", "val_accuracy", "train_loss", "train_accuracy"],
+            default=early_defaults.get("metric", "val_loss"),
+        ).ask()
+        if metric_answer is not None:
+            early_metric = metric_answer
+
+        mode_answer = questionary.select(
+            "Early stopping mode:",
+            choices=["min", "max"],
+            default=early_defaults.get("mode", "min"),
+        ).ask()
+        if mode_answer is not None:
+            early_mode = mode_answer
     report_name = questionary.text(
         "CSV report filename (saved in project root):",
         default=cfg.report_filename,

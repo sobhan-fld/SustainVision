@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 try:
     from torch import nn
@@ -25,15 +25,20 @@ class ProjectionModel(nn.Module):  # type: ignore[name-defined]
         feature_dim: int,
         num_classes: int,
         projection_dim: int,
+        *,
+        projection_hidden_dim: Optional[int] = None,
+        use_batchnorm_projector: bool = False,
     ) -> None:
         super().__init__()
         self.backbone = backbone
         self.classifier = nn.Linear(feature_dim, num_classes)
-        self.projector = nn.Sequential(
-            nn.Linear(feature_dim, max(feature_dim, projection_dim)),
-            nn.ReLU(),
-            nn.Linear(max(feature_dim, projection_dim), projection_dim),
-        )
+        hidden_dim = projection_hidden_dim or max(feature_dim, projection_dim)
+        projector_layers = [nn.Linear(feature_dim, hidden_dim)]
+        if use_batchnorm_projector:
+            projector_layers.append(nn.BatchNorm1d(hidden_dim))
+        projector_layers.append(nn.ReLU())
+        projector_layers.append(nn.Linear(hidden_dim, projection_dim))
+        self.projector = nn.Sequential(*projector_layers)
 
     def forward(self, x: "torch.Tensor") -> Tuple["torch.Tensor", "torch.Tensor"]:  # type: ignore[name-defined]
         """Forward pass returning logits and normalized embeddings."""
@@ -54,6 +59,9 @@ def build_linear_model(
     num_classes: int,
     image_size: int,
     projection_dim: int,
+    *,
+    projection_hidden_dim: Optional[int] = None,
+    projection_use_bn: bool = False,
 ) -> ProjectionModel:
     """Build a simple MLP model as fallback."""
     if nn is None:
@@ -68,7 +76,14 @@ def build_linear_model(
         nn.Linear(1024, feature_dim),
         nn.ReLU(),
     )
-    return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+    return ProjectionModel(
+        backbone,
+        feature_dim,
+        num_classes,
+        projection_dim,
+        projection_hidden_dim=projection_hidden_dim,
+        use_batchnorm_projector=projection_use_bn,
+    )
 
 
 def build_model(
@@ -77,6 +92,8 @@ def build_model(
     num_classes: int,
     image_size: int,
     projection_dim: int,
+    projection_hidden_dim: Optional[int] = None,
+    projection_use_bn: bool = False,
 ) -> nn.Module:
     """Build a model from name, using torchvision backbones when available."""
     if nn is None:
@@ -86,42 +103,96 @@ def build_model(
 
     if tv_models is None:
         print("[warn] torchvision models unavailable. Using simple MLP classifier.")
-        return build_linear_model(num_classes, image_size, projection_dim)
+        return build_linear_model(
+            num_classes,
+            image_size,
+            projection_dim,
+            projection_hidden_dim=projection_hidden_dim,
+            projection_use_bn=projection_use_bn,
+        )
 
     try:
         if key == "resnet18":
             backbone = tv_models.resnet18(weights=None)
             feature_dim = backbone.fc.in_features
             backbone.fc = nn.Identity()
-            return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+            return ProjectionModel(
+                backbone,
+                feature_dim,
+                num_classes,
+                projection_dim,
+                projection_hidden_dim=projection_hidden_dim,
+                use_batchnorm_projector=projection_use_bn,
+            )
         if key == "resnet34":
             backbone = tv_models.resnet34(weights=None)
             feature_dim = backbone.fc.in_features
             backbone.fc = nn.Identity()
-            return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+            return ProjectionModel(
+                backbone,
+                feature_dim,
+                num_classes,
+                projection_dim,
+                projection_hidden_dim=projection_hidden_dim,
+                use_batchnorm_projector=projection_use_bn,
+            )
         if key == "resnet50":
             backbone = tv_models.resnet50(weights=None)
             feature_dim = backbone.fc.in_features
             backbone.fc = nn.Identity()
-            return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+            return ProjectionModel(
+                backbone,
+                feature_dim,
+                num_classes,
+                projection_dim,
+                projection_hidden_dim=projection_hidden_dim,
+                use_batchnorm_projector=projection_use_bn,
+            )
         if key == "mobilenet_v3_small":
             backbone = tv_models.mobilenet_v3_small(weights=None)
             feature_dim = backbone.classifier[-1].in_features
             backbone.classifier[-1] = nn.Identity()
-            return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+            return ProjectionModel(
+                backbone,
+                feature_dim,
+                num_classes,
+                projection_dim,
+                projection_hidden_dim=projection_hidden_dim,
+                use_batchnorm_projector=projection_use_bn,
+            )
         if key == "efficientnet_b0":
             backbone = tv_models.efficientnet_b0(weights=None)
             feature_dim = backbone.classifier[-1].in_features
             backbone.classifier[-1] = nn.Identity()
-            return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+            return ProjectionModel(
+                backbone,
+                feature_dim,
+                num_classes,
+                projection_dim,
+                projection_hidden_dim=projection_hidden_dim,
+                use_batchnorm_projector=projection_use_bn,
+            )
         if key in {"vit_b_16", "vit-b-16", "vit"}:
             backbone = tv_models.vit_b_16(weights=None)
             feature_dim = backbone.heads.head.in_features
             backbone.heads.head = nn.Identity()
-            return ProjectionModel(backbone, feature_dim, num_classes, projection_dim)
+            return ProjectionModel(
+                backbone,
+                feature_dim,
+                num_classes,
+                projection_dim,
+                projection_hidden_dim=projection_hidden_dim,
+                use_batchnorm_projector=projection_use_bn,
+            )
     except Exception as exc:  # pragma: no cover - model construction safeguard
         print(f"[warn] Failed to build model '{name}': {exc}. Falling back to MLP classifier.")
 
     print(f"[warn] Unsupported model '{name}'. Using simple MLP classifier instead.")
-    return build_linear_model(num_classes, image_size, projection_dim)
+    return build_linear_model(
+        num_classes,
+        image_size,
+        projection_dim,
+        projection_hidden_dim=projection_hidden_dim,
+        projection_use_bn=projection_use_bn,
+    )
 

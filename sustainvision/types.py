@@ -20,6 +20,8 @@ class EpochMetrics:
     phase: str = "train"
     loss_name: str = ""
     loss_mode: str = ""
+    optimizer_name: str = ""
+    projector_hidden_dim: Optional[int] = None
 
 
 @dataclass

@@ -61,6 +61,7 @@ def write_report_csv(
             loss_name = metrics.loss_name or config.loss_function
             loss_mode = (metrics.loss_mode or "").lower()
             is_contrastive = loss_mode in {"simclr", "supcon"} or loss_name.lower() in {"simclr", "supcon"}
+            optimizer_name = metrics.optimizer_name or config.optimizer
 
             row = {
                 "epoch": metrics.epoch,
@@ -81,7 +82,7 @@ def write_report_csv(
                 "model": config.model,
                 "database": config.database,
                 "device": config.device,
-                "optimizer": config.optimizer,
+                "optimizer": optimizer_name,
                 "loss_function": config.loss_function,
                 "weight_decay": config.weight_decay,
                 "scheduler": config.scheduler,
@@ -100,6 +101,9 @@ def write_report_csv(
         
         # Only write summary row if not appending (summary written at end of all phases)
         if not append:
+            summary_optimizer = config.optimizer
+            if epochs:
+                summary_optimizer = epochs[-1].optimizer_name or config.optimizer
             writer.writerow(
                 {
                     "epoch": "summary",
@@ -121,7 +125,7 @@ def write_report_csv(
                     "model": config.model,
                     "database": config.database,
                     "device": config.device,
-                    "optimizer": config.optimizer,
+                    "optimizer": summary_optimizer,
                     "loss_function": config.loss_function,
                     "weight_decay": config.weight_decay,
                     "scheduler": config.scheduler,

@@ -44,6 +44,12 @@ def _parse_schedule_config(config: TrainingConfig) -> Dict[str, Any]:
         "pretrain_loss": str(schedule_cfg.get("pretrain_loss", "simclr")),
         "finetune_loss": str(schedule_cfg.get("finetune_loss", "cross_entropy")),
         "finetune_lr": float(finetune_lr) if finetune_lr is not None else base_lr,
+        "finetune_optimizer": schedule_cfg.get("finetune_optimizer"),
+        "finetune_weight_decay": (
+            float(schedule_cfg.get("finetune_weight_decay"))
+            if schedule_cfg.get("finetune_weight_decay") is not None
+            else None
+        ),
         "freeze_backbone": bool(schedule_cfg.get("freeze_backbone", False)),
         "optimizer_reset": bool(schedule_cfg.get("optimizer_reset", True)),
     }
@@ -134,6 +140,8 @@ def _run_finetune_phase(
         loss_function_override=params["finetune_loss"],
         epochs_override=params["finetune_epochs"],
         lr_override=params["finetune_lr"],
+        optimizer_override=params.get("finetune_optimizer"),
+        weight_decay_override=params.get("finetune_weight_decay"),
         freeze_backbone_override=params["freeze_backbone"],
         skip_emissions_tracker=True,
         reset_classifier=params["freeze_backbone"],

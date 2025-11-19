@@ -104,6 +104,8 @@ class TrainingConfig:
             "pretrain_loss": "simclr",
             "finetune_loss": "cross_entropy",
             "finetune_lr": None,  # None means use same LR as pretrain
+            "finetune_optimizer": None,
+            "finetune_weight_decay": None,
             "freeze_backbone": False,
             "optimizer_reset": True,
         }
@@ -123,6 +125,9 @@ class TrainingConfig:
             "lars_eta": 0.001,
             "lars_eps": 1e-9,
             "lars_exclude_bias_n_norm": True,
+            "projection_hidden_dim": None,
+            "projection_use_bn": False,
+            "use_gaussian_blur": False,
         }
     )
 
