@@ -19,8 +19,9 @@ def _start_training(cm: ConfigManager) -> None:
     """Kick off a training run and display summary output."""
 
     config = cm.load()
+    output_root = Path.cwd() / "outputs"
     try:
-        summary: TrainingRunSummary = train_model(config, project_root=Path.cwd())
+        summary: TrainingRunSummary = train_model(config, project_root=output_root)
     except MissingDependencyError as exc:
         print(f"\n[error] {exc}\n")
         return

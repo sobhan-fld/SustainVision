@@ -89,7 +89,7 @@ class TrainingConfig:
     gradient_clip_norm: Optional[float] = None
     mixed_precision: bool = False
     save_model: bool = False
-    save_model_path: str = "artifacts"
+    save_model_path: str = "outputs/checkpoints"
     checkpoint_path: Optional[str] = None
     freeze_backbone: bool = False
     early_stopping: Dict[str, Any] = field(

@@ -5,5 +5,8 @@ databases/*
 !databases/.gitkeep
 sustainvision/__pycache__/
 sustainvision/*.pyc
+# Legacy outputs and logs
+output_old/
+outputs/
 emissions.csv
 training_report.csv

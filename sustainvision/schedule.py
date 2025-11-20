@@ -263,7 +263,8 @@ def run_contrastive_schedule(
         TrainingRunSummary with aggregated metrics and emissions
     """
     # Setup paths and parse configuration
-    project_dir = project_root or Path.cwd()
+    project_dir = project_root or (Path.cwd() / "outputs")
+    project_dir.mkdir(parents=True, exist_ok=True)
     report_path = unique_report_path(project_dir, config.report_filename)
     params = _parse_schedule_config(config)
     

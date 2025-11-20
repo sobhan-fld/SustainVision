@@ -87,7 +87,7 @@ def train_model(
     """
     schedule_cfg = config.simclr_schedule or {}
     schedule_enabled = bool(schedule_cfg.get("enabled", False))
-    
+    project_root = project_root or (Path.cwd() / "outputs")
     if not schedule_enabled:
         # Standard single-phase training
         summary, _ = _execute_training_phase(
@@ -138,7 +138,7 @@ def _execute_training_phase(
 
     set_seed(config.seed)
 
-    project_dir = project_root or Path.cwd()
+    project_dir = project_root or (Path.cwd() / "outputs")
     project_dir.mkdir(parents=True, exist_ok=True)
     report_path = unique_report_path(project_dir, config.report_filename)
 

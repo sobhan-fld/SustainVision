@@ -6,11 +6,18 @@ It relies on the ConfigManager to handle reading/writing YAML and device detecti
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import questionary
 
 from .config import ConfigManager, TrainingConfig
+def _derive_run_name(cfg: TrainingConfig) -> str:
+    """Infer a default run/output name from the current report filename."""
+    name = (cfg.report_filename or "training_report.csv").strip()
+    if not name:
+        return "training_run"
+    return Path(name).stem or "training_run"
 
 
 def _ask_model(current: str) -> str:
@@ -434,12 +441,14 @@ def run_config_tui(config_path: str | None = None) -> TrainingConfig:
     ).ask()
     if save_model is None:
         save_model = cfg.save_model
-    save_model_path = questionary.text(
-        "Model artifact directory:",
-        default=cfg.save_model_path,
+    default_run_name = _derive_run_name(cfg)
+    run_name_answer = questionary.text(
+        "Run / artifact name (stored under outputs/<name>):",
+        default=default_run_name,
     ).ask()
-    if not save_model_path:
-        save_model_path = cfg.save_model_path
+    run_name = (run_name_answer or default_run_name or "training_run").strip() or "training_run"
+    report_name = str(Path(run_name) / f"{run_name}.csv")
+    save_model_path = str(Path("outputs") / run_name)
     checkpoint_path = questionary.text(
         "Checkpoint path for fine-tuning (leave empty for training from scratch):",
         default=cfg.checkpoint_path or "",
@@ -490,11 +499,6 @@ def run_config_tui(config_path: str | None = None) -> TrainingConfig:
         ).ask()
         if mode_answer is not None:
             early_mode = mode_answer
-    report_name = questionary.text(
-        "CSV report filename (saved in project root):",
-        default=cfg.report_filename,
-    ).ask()
-    
     new_simclr_schedule = _ask_simclr_schedule(cfg.simclr_schedule)
 
     cm.set(
