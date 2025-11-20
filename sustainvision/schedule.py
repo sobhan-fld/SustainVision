@@ -52,6 +52,9 @@ def _parse_schedule_config(config: TrainingConfig) -> Dict[str, Any]:
         ),
         "freeze_backbone": bool(schedule_cfg.get("freeze_backbone", False)),
         "optimizer_reset": bool(schedule_cfg.get("optimizer_reset", True)),
+        "use_reference_transforms": bool(schedule_cfg.get("use_reference_transforms", False)),
+        "linear_subset_per_class": schedule_cfg.get("linear_subset_per_class"),
+        "linear_subset_seed": schedule_cfg.get("linear_subset_seed", config.seed),
     }
 
 
@@ -114,6 +117,8 @@ def _run_pretrain_phase(
         lr_override=None,  # Use base LR from config
         freeze_backbone_override=False,
         skip_emissions_tracker=True,
+        scheduler_config_override=None,
+        simclr_recipe_override=params["use_reference_transforms"],
     )
     return summary, state
 
@@ -145,6 +150,10 @@ def _run_finetune_phase(
         freeze_backbone_override=params["freeze_backbone"],
         skip_emissions_tracker=True,
         reset_classifier=params["freeze_backbone"],
+        scheduler_config_override=None,
+        simclr_recipe_override=params["use_reference_transforms"],
+        subset_per_class_override=params.get("linear_subset_per_class"),
+        subset_seed_override=params.get("linear_subset_seed"),
     )
     return summary, state
 

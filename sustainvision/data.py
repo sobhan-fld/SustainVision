@@ -174,6 +174,9 @@ def build_classification_dataloaders(
     image_size: int = 224,
     contrastive: bool = False,
     use_gaussian_blur: bool = False,
+    simclr_recipe: bool = False,
+    subset_per_class: Optional[int] = None,
+    subset_seed: Optional[int] = None,
 ) -> Tuple["DataLoader", "DataLoader", int]:  # type: ignore[name-defined]
     """Create train/val dataloaders for common classification datasets."""
 
@@ -194,6 +197,15 @@ def build_classification_dataloaders(
     val_split = max(0.0, min(float(val_split), 0.5))
     num_workers = max(0, int(num_workers))
     image_size = max(32, int(image_size))
+    subset_value: Optional[int] = None
+    if subset_per_class is not None:
+        try:
+            subset_value = int(subset_per_class)
+        except Exception:
+            subset_value = None
+        if subset_value is not None and subset_value <= 0:
+            subset_value = None
+    subset_seed = subset_seed or seed
 
     def _norm(dataset: str) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
         if dataset == "cifar10":
@@ -204,7 +216,68 @@ def build_classification_dataloaders(
 
     mean, std = _norm(dataset_kind)
 
+    def _simclr_contrastive_transform():
+        color_jitter = transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
+        return transforms.Compose(
+            [
+                transforms.RandomResizedCrop(image_size),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomApply([color_jitter], p=0.8),
+                transforms.RandomGrayscale(p=0.2),
+                transforms.ToTensor(),
+            ]
+        )
+
+    def _simclr_linear_transform(train: bool):
+        if train:
+            return transforms.Compose(
+                [
+                    transforms.RandomResizedCrop(image_size),
+                    transforms.RandomHorizontalFlip(p=0.5),
+                    transforms.ToTensor(),
+                ]
+            )
+        return transforms.Compose([transforms.ToTensor()])
+
+    def _maybe_subset(dataset, per_class: Optional[int], seed_value: int, classes: int):
+        if per_class is None or per_class <= 0:
+            return dataset
+        total_needed = per_class * classes
+        if total_needed <= 0:
+            return dataset
+        from torch.utils.data import Subset  # type: ignore
+
+        generator = torch.Generator().manual_seed(seed_value)
+        order = torch.randperm(len(dataset), generator=generator).tolist()
+        counts = [0 for _ in range(classes)]
+        selected: list[int] = []
+        for idx in order:
+            _, label = dataset[idx]
+            if isinstance(label, torch.Tensor):
+                label = int(label.item())
+            try:
+                label_int = int(label)
+            except Exception:
+                continue
+            if label_int < 0 or label_int >= classes:
+                continue
+            if counts[label_int] >= per_class:
+                continue
+            counts[label_int] += 1
+            selected.append(idx)
+            if len(selected) >= total_needed:
+                break
+        if len(selected) < total_needed:
+            print(
+                f"[warn] Requested {per_class} samples per class but only gathered {len(selected)} total samples."
+            )
+        return Subset(dataset, selected)
+
     def _base_transforms(train: bool) -> transforms.Compose:
+        if dataset_kind == "cifar10" and simclr_recipe:
+            if contrastive:
+                return _simclr_contrastive_transform()
+            return _simclr_linear_transform(train)
         ops = []
         if dataset_kind == "mnist":
             ops.append(transforms.Grayscale(num_output_channels=3))
@@ -237,7 +310,8 @@ def build_classification_dataloaders(
                 ]
             )
         ops.append(transforms.ToTensor())
-        ops.append(transforms.Normalize(mean, std))
+        if not (dataset_kind == "cifar10" and simclr_recipe):
+            ops.append(transforms.Normalize(mean, std))
         return transforms.Compose(ops)
 
     generator = torch.Generator().manual_seed(seed)
@@ -384,12 +458,16 @@ def build_classification_dataloaders(
             train_dataset = _wrap_contrastive(train_dataset, train_transform)
             val_dataset = _wrap_contrastive(val_dataset, train_transform)
 
+    if not contrastive and subset_value:
+        train_dataset = _maybe_subset(train_dataset, subset_value, subset_seed, num_classes)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
+        drop_last=contrastive,
     )
     val_loader = DataLoader(
         val_dataset,

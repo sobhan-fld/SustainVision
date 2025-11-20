@@ -119,6 +119,10 @@ def _execute_training_phase(
     freeze_backbone_override: Optional[bool] = None,
     skip_emissions_tracker: bool = False,
     reset_classifier: bool = False,
+    scheduler_config_override: Optional[Dict[str, Any]] = None,
+    simclr_recipe_override: Optional[bool] = None,
+    subset_per_class_override: Optional[int] = None,
+    subset_seed_override: Optional[int] = None,
 ) -> Tuple[TrainingRunSummary, dict]:
     """Train a toy model using the provided configuration.
 
@@ -161,6 +165,25 @@ def _execute_training_phase(
     )
     projection_use_bn = bool(config.hyperparameters.get("projection_use_bn", False))
     use_gaussian_blur = bool(config.hyperparameters.get("use_gaussian_blur", False))
+    simclr_recipe = (
+        bool(simclr_recipe_override)
+        if simclr_recipe_override is not None
+        else bool(config.hyperparameters.get("simclr_reference_transforms", False))
+    )
+    subset_per_class = subset_per_class_override
+    if subset_per_class is None:
+        subset_per_class = config.hyperparameters.get("linear_subset_per_class")
+    if isinstance(subset_per_class, str):
+        subset_per_class = subset_per_class.strip()
+        subset_per_class = int(subset_per_class) if subset_per_class else None
+    elif subset_per_class is not None:
+        try:
+            subset_per_class = int(subset_per_class)
+        except Exception:
+            subset_per_class = None
+    subset_seed = subset_seed_override
+    if subset_seed is None:
+        subset_seed = int(config.hyperparameters.get("linear_subset_seed", config.seed))
     lars_eta = float(config.hyperparameters.get("lars_eta", 0.001))
     lars_eps = float(config.hyperparameters.get("lars_eps", 1e-9))
     lars_exclude_bias_n_norm = bool(config.hyperparameters.get("lars_exclude_bias_n_norm", True))
@@ -170,6 +193,7 @@ def _execute_training_phase(
     contrastive_mode = loss_spec.mode in {"simclr", "supcon"}
     classification_mode = not contrastive_mode
 
+    data_root = Path.cwd()
     try:
         train_loader, val_loader, num_classes = build_classification_dataloaders(
             config.database,
@@ -177,10 +201,13 @@ def _execute_training_phase(
             num_workers=num_workers,
             val_split=val_split,
             seed=config.seed,
-            project_root=project_dir,
+            project_root=data_root,
             image_size=image_size,
             contrastive=contrastive_mode,
             use_gaussian_blur=use_gaussian_blur if contrastive_mode else False,
+            simclr_recipe=simclr_recipe,
+            subset_per_class=subset_per_class if (subset_per_class and classification_mode) else None,
+            subset_seed=subset_seed,
         )
     except DatasetPreparationError as exc:
         raise MissingDependencyError(str(exc)) from exc
@@ -256,7 +283,18 @@ def _execute_training_phase(
         lars_eps=lars_eps,
         lars_exclude_bias_n_norm=lars_exclude_bias_n_norm,
     )
-    scheduler = build_scheduler(config.scheduler, optimizer)
+    scheduler_config = scheduler_config_override if scheduler_config_override is not None else config.scheduler
+    scheduler_cfg_copy = copy.deepcopy(scheduler_config) if isinstance(scheduler_config, dict) else None
+    scheduler_step_on_batch = False
+    if isinstance(scheduler_cfg_copy, dict):
+        scheduler_step_on_batch = bool(scheduler_cfg_copy.pop("step_on_batch", False))
+        scheduler_params = scheduler_cfg_copy.get("params", {}) or {}
+        t_max_strategy = scheduler_params.pop("t_max_strategy", None)
+        if t_max_strategy == "per_batch":
+            effective_steps = max(1, epochs * max(1, len(train_loader)))
+            scheduler_params["t_max"] = effective_steps
+        scheduler_cfg_copy["params"] = scheduler_params
+    scheduler = build_scheduler(scheduler_cfg_copy, optimizer) if scheduler_cfg_copy else None
 
     use_amp = bool(config.mixed_precision) and device.type == "cuda" and amp is not None
     scaler = amp.GradScaler(enabled=use_amp) if amp is not None else None
@@ -475,8 +513,10 @@ def _execute_training_phase(
                             print(notice)
                         break
 
-            if scheduler is not None:
+            if scheduler is not None and scheduler_step_on_batch:
                 scheduler.step()
+        if scheduler is not None and not scheduler_step_on_batch:
+            scheduler.step()
         if use_tqdm and hasattr(epoch_iterable, "close"):
             epoch_iterable.close()
 

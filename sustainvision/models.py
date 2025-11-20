@@ -114,6 +114,9 @@ def build_model(
     try:
         if key == "resnet18":
             backbone = tv_models.resnet18(weights=None)
+            if image_size <= 64:
+                backbone.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+                backbone.maxpool = nn.Identity()
             feature_dim = backbone.fc.in_features
             backbone.fc = nn.Identity()
             return ProjectionModel(
@@ -126,6 +129,9 @@ def build_model(
             )
         if key == "resnet34":
             backbone = tv_models.resnet34(weights=None)
+            if image_size <= 64:
+                backbone.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+                backbone.maxpool = nn.Identity()
             feature_dim = backbone.fc.in_features
             backbone.fc = nn.Identity()
             return ProjectionModel(
@@ -138,6 +144,9 @@ def build_model(
             )
         if key == "resnet50":
             backbone = tv_models.resnet50(weights=None)
+            if image_size <= 64:
+                backbone.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
+                backbone.maxpool = nn.Identity()
             feature_dim = backbone.fc.in_features
             backbone.fc = nn.Identity()
             return ProjectionModel(

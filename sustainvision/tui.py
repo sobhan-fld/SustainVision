@@ -104,6 +104,20 @@ def _ask_hyperparameters(hp: Dict[str, Any]) -> Dict[str, Any]:
         "Add Gaussian blur to contrastive augmentations?",
         default=bool(hp.get("use_gaussian_blur", False)),
     ).ask()
+    use_reference_transforms = questionary.confirm(
+        "Use CIFAR-10 SimCLR reference transforms?",
+        default=bool(hp.get("simclr_reference_transforms", False)),
+    ).ask()
+    subset_default = hp.get("linear_subset_per_class")
+    subset_prompt = "Linear-eval subset per class (0 = entire dataset):"
+    subset_value = questionary.text(
+        subset_prompt,
+        default=str(subset_default or 0),
+    ).ask()
+    subset_seed_value = questionary.text(
+        "Linear-eval subset seed:",
+        default=str(hp.get("linear_subset_seed", 42)),
+    ).ask()
 
     def as_int(value: str, default: int) -> int:
         try:
@@ -116,6 +130,15 @@ def _ask_hyperparameters(hp: Dict[str, Any]) -> Dict[str, Any]:
             return float(value)
         except Exception:
             return default
+
+    def as_subset_int(value: Optional[str], current: Optional[int]) -> Optional[int]:
+        if value is None:
+            return current if isinstance(current, int) and current > 0 else None
+        try:
+            parsed = int(str(value).strip())
+        except Exception:
+            return current if isinstance(current, int) and current > 0 else None
+        return parsed if parsed > 0 else None
 
     return {
         "batch_size": as_int(batch_size, hp.get("batch_size", 32)),
@@ -132,6 +155,9 @@ def _ask_hyperparameters(hp: Dict[str, Any]) -> Dict[str, Any]:
         else as_int(projection_hidden_dim, hp.get("projection_hidden_dim", 0) or 0),
         "projection_use_bn": bool(use_bn_projection),
         "use_gaussian_blur": bool(use_gaussian_blur),
+        "simclr_reference_transforms": bool(use_reference_transforms),
+        "linear_subset_per_class": as_subset_int(subset_value, hp.get("linear_subset_per_class")),
+        "linear_subset_seed": as_int(subset_seed_value, hp.get("linear_subset_seed", 42)),
     }
 
 
@@ -194,7 +220,11 @@ def _ask_scheduler(scheduler: Dict[str, Any]) -> Dict[str, Any]:
     ).ask()
 
     if choice == "none":
-        return {"type": "none", "params": {}}
+        step_each_batch = questionary.confirm(
+            "Update scheduler every batch?",
+            default=bool(scheduler.get("step_on_batch", False)),
+        ).ask()
+        return {"type": "none", "params": {}, "step_on_batch": bool(step_each_batch)}
 
     if choice == "custom":
         custom_type = questionary.text("Scheduler name:", default=sched_type).ask()
@@ -202,7 +232,11 @@ def _ask_scheduler(scheduler: Dict[str, Any]) -> Dict[str, Any]:
             "Scheduler params as key=value pairs (comma separated):",
             default=", ".join(f"{k}={v}" for k, v in (scheduler.get("params", {}) or {}).items()),
         ).ask()
-        return {"type": custom_type, "params": _parse_params(params_text)}
+        step_each_batch = questionary.confirm(
+            "Update scheduler every batch?",
+            default=bool(scheduler.get("step_on_batch", False)),
+        ).ask()
+        return {"type": custom_type, "params": _parse_params(params_text), "step_on_batch": bool(step_each_batch)}
 
     params_defaults = {
         "step_lr": {"step_size": 10, "gamma": 0.1},
@@ -214,7 +248,21 @@ def _ask_scheduler(scheduler: Dict[str, Any]) -> Dict[str, Any]:
     for key, default in defaults.items():
         value = questionary.text(f"{choice}::{key}", default=str(scheduler.get("params", {}).get(key, default))).ask()
         params[key] = _safe_number(value, default)
-    return {"type": choice, "params": params}
+    if choice == "cosine_annealing":
+        auto_tmax = questionary.confirm(
+            "Set cosine T_max based on total train steps (per-batch SimCLR style)?",
+            default=str(scheduler.get("params", {}).get("t_max_strategy", "")).lower() == "per_batch",
+        ).ask()
+        if auto_tmax:
+            params.pop("t_max", None)
+            params["t_max_strategy"] = "per_batch"
+        else:
+            params.pop("t_max_strategy", None)
+    step_each_batch = questionary.confirm(
+        "Update scheduler every batch?",
+        default=bool(scheduler.get("step_on_batch", False)),
+    ).ask()
+    return {"type": choice, "params": params, "step_on_batch": bool(step_each_batch)}
 
 
 def _parse_params(raw: Optional[str]) -> Dict[str, Any]:
@@ -375,6 +423,28 @@ def _ask_simclr_schedule(schedule: Dict[str, Any]) -> Dict[str, Any]:
     ).ask()
     if optimizer_reset is None:
         optimizer_reset = schedule.get("optimizer_reset", True)
+
+    use_reference = questionary.confirm(
+        "Use SimCLR reference transforms for CIFAR-10?",
+        default=schedule.get("use_reference_transforms", False),
+    ).ask()
+    subset_linear = questionary.text(
+        "Linear-eval subset per class (0 = full dataset):",
+        default=str(schedule.get("linear_subset_per_class") or 0),
+    ).ask()
+    subset_linear_seed = questionary.text(
+        "Linear-eval subset seed:",
+        default=str(schedule.get("linear_subset_seed", 42)),
+    ).ask()
+
+    def _subset_value(raw: Optional[str], current):
+        if raw is None:
+            return current if isinstance(current, int) and current > 0 else None
+        try:
+            parsed = int(str(raw).strip())
+        except Exception:
+            return current if isinstance(current, int) and current > 0 else None
+        return parsed if parsed > 0 else None
     
     return {
         "enabled": enabled,
@@ -388,6 +458,13 @@ def _ask_simclr_schedule(schedule: Dict[str, Any]) -> Dict[str, Any]:
         "finetune_weight_decay": finetune_weight_decay,
         "freeze_backbone": freeze_backbone,
         "optimizer_reset": optimizer_reset,
+        "use_reference_transforms": bool(use_reference),
+        "linear_subset_per_class": _subset_value(subset_linear, schedule.get("linear_subset_per_class")),
+        "linear_subset_seed": (
+            schedule.get("linear_subset_seed", 42)
+            if subset_linear_seed is None or subset_linear_seed.strip() == ""
+            else _safe_positive_int(subset_linear_seed, schedule.get("linear_subset_seed", 42))
+        ),
     }
 
 

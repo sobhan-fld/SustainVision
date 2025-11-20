@@ -84,7 +84,7 @@ class TrainingConfig:
     loss_function: str = "cross_entropy"
     weight_decay: float = 0.0
     scheduler: Dict[str, Any] = field(
-        default_factory=lambda: {"type": "none", "params": {}}
+        default_factory=lambda: {"type": "none", "params": {}, "step_on_batch": False}
     )
     gradient_clip_norm: Optional[float] = None
     mixed_precision: bool = False
@@ -108,6 +108,9 @@ class TrainingConfig:
             "finetune_weight_decay": None,
             "freeze_backbone": False,
             "optimizer_reset": True,
+            "use_reference_transforms": False,
+            "linear_subset_per_class": None,
+            "linear_subset_seed": 42,
         }
     )
     report_filename: str = "training_report.csv"
@@ -128,6 +131,9 @@ class TrainingConfig:
             "projection_hidden_dim": None,
             "projection_use_bn": False,
             "use_gaussian_blur": False,
+            "simclr_reference_transforms": False,
+            "linear_subset_per_class": None,
+            "linear_subset_seed": 42,
         }
     )
 
