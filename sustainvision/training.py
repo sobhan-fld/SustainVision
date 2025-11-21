@@ -297,7 +297,11 @@ def _execute_training_phase(
     scheduler = build_scheduler(scheduler_cfg_copy, optimizer) if scheduler_cfg_copy else None
 
     use_amp = bool(config.mixed_precision) and device.type == "cuda" and amp is not None
-    scaler = amp.GradScaler(enabled=use_amp) if amp is not None else None
+    scaler = None
+    if use_amp and torch is not None and hasattr(torch, "amp"):
+        scaler = torch.amp.GradScaler("cuda", enabled=True)
+    elif use_amp and amp is not None:
+        scaler = amp.GradScaler(enabled=True)
 
     tracker = None
     if not skip_emissions_tracker:
@@ -393,6 +397,8 @@ def _execute_training_phase(
                         torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
                     scaler.step(optimizer)
                     scaler.update()
+                    if scheduler is not None and scheduler_step_on_batch:
+                        scheduler.step()
                 else:
                     logits, embeddings = model(inputs)
                     loss = compute_loss(loss_spec, logits, embeddings, labels, temperature)
@@ -400,6 +406,8 @@ def _execute_training_phase(
                     if config.gradient_clip_norm is not None:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
                     optimizer.step()
+                    if scheduler is not None and scheduler_step_on_batch:
+                        scheduler.step()
 
                 batch_weight = float(inputs.size(0)) if contrastive_mode else 1.0
                 epoch_loss += loss.item() * batch_weight
@@ -513,8 +521,7 @@ def _execute_training_phase(
                             print(notice)
                         break
 
-            if scheduler is not None and scheduler_step_on_batch:
-                scheduler.step()
+            # When stepping per batch we already advanced the scheduler inside the loop
         if scheduler is not None and not scheduler_step_on_batch:
             scheduler.step()
         if use_tqdm and hasattr(epoch_iterable, "close"):

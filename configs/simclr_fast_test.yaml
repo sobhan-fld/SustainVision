@@ -1,0 +1,65 @@
+model: resnet18
+database: databases/cifar10
+device: cuda:1
+seed: 42
+optimizer: sgd
+loss_function: simclr
+weight_decay: 1.0e-06
+
+scheduler:
+  type: cosine_annealing
+  params:
+    eta_min: 0.001
+    t_max_strategy: per_batch
+  step_on_batch: true
+
+gradient_clip_norm: null
+mixed_precision: false
+save_model: true            # flip to true if you want checkpoints
+save_model_path: outputs/SimCLR_20_5
+checkpoint_path: null
+freeze_backbone: false
+
+early_stopping:
+  enabled: false
+  patience: 3
+  metric: val_loss
+  mode: min
+
+simclr_schedule:
+  enabled: true
+  cycles: 1
+  pretrain_epochs: 20        # ← contrastive phase
+  finetune_epochs: 5         # ← linear eval
+  pretrain_loss: simclr
+  finetune_loss: cross_entropy
+  finetune_lr: 0.2
+  finetune_optimizer: sgd
+  finetune_weight_decay: 0.0
+  freeze_backbone: true
+  optimizer_reset: true
+  use_reference_transforms: true
+  linear_subset_per_class: null
+  linear_subset_seed: 42
+
+report_filename: SimCLR_20_5/SimCLR_20_5.csv
+
+hyperparameters:
+  batch_size: 512
+  lr: 0.6
+  epochs: 20
+  momentum: 0.9
+  temperature: 0.5
+  num_workers: 16
+  val_split: 0.0
+  image_size: 32
+  projection_dim: 128
+  lars_eta: 0.001
+  lars_eps: 1.0e-09
+  lars_exclude_bias_n_norm: true
+  projection_hidden_dim: 2048
+  projection_use_bn: false
+  use_gaussian_blur: false
+  simclr_reference_transforms: true
+  linear_subset_per_class: null
+  linear_subset_seed: 42

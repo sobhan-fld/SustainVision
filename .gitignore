@@ -10,3 +10,4 @@ output_old/
 outputs/
 emissions.csv
 training_report.csv
+logs/
