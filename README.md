@@ -318,6 +318,15 @@ Contributing & Feedback
 
 We welcome issues, feature requests, and success stories. Tell us how you are using SustainVision, where the workflows feel clunky, or what sustainability metrics you would love to track next. If you plan to open a pull request, please follow common Python conventions (linting, type hints where practical, and clear docstrings that explain why a change exists).
 
+
+example Command for running from config
+-------
+cd /home/sfooladi/github/SustainVision
+PYTHONPATH=$(pwd) ~/.virtualenvs/SustainVision/bin/python scripts/run_with_config.py \
+  --config configs/cifar10_resnet18_ce.yaml \
+  --project-root outputs \
+  | tee logs/ce_cifar10_$(date +%Y%m%d_%H%M%S).log
+
 License
 -------
 
