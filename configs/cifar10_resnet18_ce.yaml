@@ -23,7 +23,7 @@ freeze_backbone: false
 simclr_schedule:
   enabled: false
 
-report_filename: outputs/CE_CIFAR10/CE_CIFAR10.csv
+report_filename: CE_CIFAR10/CE_CIFAR10.csv
 
 hyperparameters:
   batch_size: 256
