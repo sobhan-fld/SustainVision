@@ -1,22 +1,33 @@
-model: mobilenet_v3_small
+model: mobilenet_v3_large
 database: databases/cifar10
 device: cuda:1
 seed: 42
-optimizer: lars
+optimizer: sgd
 loss_function: supcon
-weight_decay: 0.00001
+weight_decay: 0.0005
 scheduler:
-  type: cosine_annealing
+  type: warmup_cosine
   params:
     eta_min: 0.001
-    t_max_strategy: per_batch
-  step_on_batch: true
+    t_max: 600
+    warmup_epochs: 5
+    warmup_start_factor: 0.1
+  step_on_batch: false
 gradient_clip_norm: null
 mixed_precision: true
 save_model: true
-save_model_path: outputs/SupCon_MobileNet
+save_model_path: outputs/SupCon_MobileNetLarge
 checkpoint_path: null
 freeze_backbone: false
+quantization:
+  enabled: false
+  approach: dynamic
+  dtype: qint8
+  modules: ["Linear"]
+  backend: qnnpack
+  export_format: torchscript
+  artifact_name: null
+  custom: false
 early_stopping:
   enabled: false
   patience: 3
@@ -30,7 +41,7 @@ simclr_schedule:
   finetune_epochs: 100        # Linear evaluation finetune phase
   pretrain_loss: supcon
   finetune_loss: cross_entropy
-  finetune_lr: 10.0           # Linear probe LR tuned for MobileNet backbone
+  finetune_lr: 8.0            # Linear probe LR tuned for MobileNetV3-Large
   finetune_optimizer: sgd
   finetune_weight_decay: 0.0
   freeze_backbone: true       # Freeze backbone during finetune (linear evaluation)
@@ -39,19 +50,19 @@ simclr_schedule:
   linear_subset_per_class: null
   linear_subset_seed: 42
 
-report_filename: SupCon_MobileNet/SupCon_MobileNet.csv
+report_filename: SupCon_MobileNetLarge/SupCon_MobileNetLarge.csv
 
 hyperparameters:
-  batch_size: 640             # Stable SupCon batch for RTX 2080 Ti (two views = 1280 samples)
-  lr: 0.18                    # Stable LR for LARS + large batch
+  batch_size: 512             # Conservative batch for large backbone (two views = 1024 samples)
+  lr: 0.2                     # Base LR for SGD + cosine schedule
   epochs: 600                 # Will be overridden by schedule
   momentum: 0.9
-  temperature: 0.05           # Sharper similarities for lightweight backbone
+  temperature: 0.05           # Sharper similarities for MobileNet architectures
   num_workers: 8
   val_split: 0.0              # Use full training set for contrastive learning
   image_size: 32              # CIFAR-10 size
   projection_dim: 128         # Output dimension for contrastive learning
-  projection_hidden_dim: 1024 # Lighter projector for MobileNet
+  projection_hidden_dim: 2048 # Larger projector for higher-capacity backbone
   projection_use_bn: true
   use_gaussian_blur: true     # Gaussian blur augmentation for SupCon
   simclr_reference_transforms: true

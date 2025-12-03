@@ -118,7 +118,7 @@ def supcon_loss(
     
     if embeddings.size(0) % 2 != 0:
         raise ValueError("SupCon embeddings must contain an even number of samples (two views per item).")
-
+    
     device = embeddings.device
     n_views = 2
     batch_size = embeddings.size(0) // n_views

@@ -226,7 +226,7 @@ Available Options Cheat Sheet
 
 **Models**
 - `resnet18`, `resnet34`, `resnet50`
-- `mobilenet_v3_small`
+- `mobilenet_v3_small`, `mobilenet_v3_large`
 - `efficientnet_b0`
 - `vit_b_16`
 - Any custom model string (falls back to an MLP classifier if not recognized)
@@ -245,6 +245,7 @@ Available Options Cheat Sheet
 - `none` (default)
 - `step_lr` (`step_size`, `gamma`)
 - `cosine_annealing` (`t_max`, `eta_min`)
+- `warmup_cosine` (`warmup_epochs`, `warmup_start_factor`, `t_max`, `eta_min`)
 - `exponential` (`gamma`)
 
 **Devices**
@@ -327,6 +328,12 @@ PYTHONPATH=$(pwd) ~/.virtualenvs/SustainVision/bin/python scripts/run_with_confi
   --config configs/cifar10_resnet18_ce.yaml \
   --project-root outputs \
   | tee logs/ce_cifar10_$(date +%Y%m%d_%H%M%S).log
+
+cd /home/sfooladi/github/SustainVision
+PYTHONPATH=$(pwd) ~/.virtualenvs/SustainVision/bin/python scripts/run_with_config.py \
+  --config configs/cifar10_mobilenet_large_supcon.yaml \
+  --project-root outputs \
+  | tee logs/supcon_mbv3large_$(date +%Y%m%d_%H%M%S).log
 
 License
 -------

@@ -207,6 +207,16 @@ def train_model(
     schedule_cfg = config.simclr_schedule or {}
     schedule_enabled = bool(schedule_cfg.get("enabled", False))
     project_root = project_root or (Path.cwd() / "outputs")
+    if project_root:
+        try:
+            print("\n[info] Training configuration snapshot:")
+            print(f"  - model: {config.model}")
+            print(f"  - loss: {config.loss_function}")
+            print(f"  - optimizer: {config.optimizer} (lr={config.hyperparameters.get('lr')})")
+            if config.scheduler:
+                print(f"  - scheduler: {config.scheduler.get('type')} {config.scheduler.get('params')}")
+        except Exception:
+            pass
     if not schedule_enabled:
         # Standard single-phase training
         summary, _ = _execute_training_phase(
@@ -407,13 +417,25 @@ def _execute_training_phase(
     scheduler_config = scheduler_config_override if scheduler_config_override is not None else config.scheduler
     scheduler_cfg_copy = copy.deepcopy(scheduler_config) if isinstance(scheduler_config, dict) else None
     scheduler_step_on_batch = False
+    scheduler_type = ""
     if isinstance(scheduler_cfg_copy, dict):
+        scheduler_type = str(scheduler_cfg_copy.get("type", "") or "").lower()
         scheduler_step_on_batch = bool(scheduler_cfg_copy.pop("step_on_batch", False))
         scheduler_params = scheduler_cfg_copy.get("params", {}) or {}
         t_max_strategy = scheduler_params.pop("t_max_strategy", None)
+        steps_per_epoch = max(1, len(train_loader))
+        total_units = epochs * (steps_per_epoch if scheduler_step_on_batch else 1)
+        warmup_epochs_raw = scheduler_params.pop("warmup_epochs", 0)
+        try:
+            warmup_epochs_val = int(warmup_epochs_raw)
+        except Exception:
+            warmup_epochs_val = 0
+        warmup_units = warmup_epochs_val * (steps_per_epoch if scheduler_step_on_batch else 1)
+        if scheduler_type == "warmup_cosine":
+            scheduler_params["warmup_steps"] = max(0, warmup_units)
+            scheduler_params.setdefault("warmup_start_factor", 0.0)
         if t_max_strategy == "per_batch":
-            effective_steps = max(1, epochs * max(1, len(train_loader)))
-            scheduler_params["t_max"] = effective_steps
+            scheduler_params["t_max"] = max(1, total_units - max(0, warmup_units))
         scheduler_cfg_copy["params"] = scheduler_params
     scheduler = build_scheduler(scheduler_cfg_copy, optimizer) if scheduler_cfg_copy else None
 
@@ -487,6 +509,7 @@ def _execute_training_phase(
             loss_normalizer = 0.0
             correct = 0
             total = 0
+            epoch_had_optimizer_step = False
 
             batch_iterable = train_loader
             if use_tqdm:
@@ -511,7 +534,6 @@ def _execute_training_phase(
                 labels = labels.to(device)
 
                 optimizer.zero_grad()
-
                 optimizer_step_done = False
 
                 if use_amp and scaler is not None and autocast_factory is not None:
@@ -536,6 +558,8 @@ def _execute_training_phase(
 
                 if scheduler is not None and scheduler_step_on_batch and optimizer_step_done:
                     scheduler.step()
+                if optimizer_step_done:
+                    epoch_had_optimizer_step = True
 
                 batch_weight = float(inputs.size(0)) if contrastive_mode else 1.0
                 epoch_loss += loss.item() * batch_weight
@@ -544,6 +568,9 @@ def _execute_training_phase(
                     preds = logits.argmax(dim=1)
                     correct += (preds == labels).sum().item()
                     total += labels.size(0)
+
+            if scheduler is not None and not scheduler_step_on_batch and epoch_had_optimizer_step:
+                scheduler.step()
 
             if use_tqdm:
                 try:
@@ -649,9 +676,6 @@ def _execute_training_phase(
                             print(notice)
                         break
 
-            # When stepping per batch we already advanced the scheduler inside the loop
-        if scheduler is not None and not scheduler_step_on_batch:
-            scheduler.step()
         if use_tqdm and hasattr(epoch_iterable, "close"):
             epoch_iterable.close()
 

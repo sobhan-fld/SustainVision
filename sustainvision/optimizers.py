@@ -171,6 +171,37 @@ def build_scheduler(config: Dict[str, Any], optimizer) -> Optional[Any]:
         eta_min = float(params.get("eta_min", 0.0))
         return torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=t_max, eta_min=eta_min)
 
+    if sched_type == "warmup_cosine":
+        warmup_steps = max(0, int(params.get("warmup_steps", 0)))
+        t_max = max(1, int(params.get("t_max", 10)))
+        eta_min = float(params.get("eta_min", 0.0))
+        warmup_start_factor = float(params.get("warmup_start_factor", 0.0))
+
+        schedulers = []
+        milestones = []
+
+        if warmup_steps > 0:
+            warmup_sched = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=warmup_start_factor,
+                end_factor=1.0,
+                total_iters=warmup_steps,
+            )
+            schedulers.append(warmup_sched)
+            milestones.append(warmup_steps)
+
+        cosine_t_max = max(1, t_max - warmup_steps) if warmup_steps > 0 else t_max
+        cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=cosine_t_max,
+            eta_min=eta_min,
+        )
+        schedulers.append(cosine_sched)
+
+        if milestones:
+            return torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=schedulers, milestones=milestones)
+        return cosine_sched
+
     if sched_type == "exponential":
         gamma = float(params.get("gamma", 0.95))
         return torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=gamma)

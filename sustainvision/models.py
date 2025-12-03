@@ -204,6 +204,19 @@ def build_model(
                 projection_hidden_dim=projection_hidden_dim,
                 use_batchnorm_projector=projection_use_bn,
             )
+        if key == "mobilenet_v3_large":
+            backbone = tv_models.mobilenet_v3_large(weights=None)
+            _adapt_mobilenet_for_small_images(backbone, image_size)
+            feature_dim = backbone.classifier[-1].in_features
+            backbone.classifier[-1] = nn.Identity()
+            return ProjectionModel(
+                backbone,
+                feature_dim,
+                num_classes,
+                projection_dim,
+                projection_hidden_dim=projection_hidden_dim,
+                use_batchnorm_projector=projection_use_bn,
+            )
         if key == "efficientnet_b0":
             backbone = tv_models.efficientnet_b0(weights=None)
             feature_dim = backbone.classifier[-1].in_features

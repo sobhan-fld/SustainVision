@@ -25,6 +25,9 @@ def _ask_model(current: str) -> str:
     presets = [
         "resnet18",
         "resnet34",
+        "resnet50",
+        "mobilenet_v3_small",
+        "mobilenet_v3_large",
         "vit-base",
         "bert-base-uncased",
         "custom",
