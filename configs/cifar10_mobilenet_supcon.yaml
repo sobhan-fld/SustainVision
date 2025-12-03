@@ -1,0 +1,60 @@
+model: mobilenet_v3_small
+database: databases/cifar10
+device: cuda:1
+seed: 42
+optimizer: sgd
+loss_function: supcon
+weight_decay: 0.0001
+scheduler:
+  type: cosine_annealing
+  params:
+    eta_min: 0.001
+    t_max_strategy: per_batch
+  step_on_batch: true
+gradient_clip_norm: null
+mixed_precision: true
+save_model: true
+save_model_path: outputs/SupCon_MobileNet
+checkpoint_path: null
+freeze_backbone: false
+early_stopping:
+  enabled: false
+  patience: 3
+  metric: val_loss
+  mode: min
+
+simclr_schedule:
+  enabled: true
+  cycles: 1
+  pretrain_epochs: 600        # SupCon pretraining phase
+  finetune_epochs: 100        # Linear evaluation finetune phase
+  pretrain_loss: supcon
+  finetune_loss: cross_entropy
+  finetune_lr: 10.0           # Linear probe LR tuned for MobileNet backbone
+  finetune_optimizer: sgd
+  finetune_weight_decay: 0.0
+  freeze_backbone: true       # Freeze backbone during finetune (linear evaluation)
+  optimizer_reset: true
+  use_reference_transforms: true
+  linear_subset_per_class: null
+  linear_subset_seed: 42
+
+report_filename: SupCon_MobileNet/SupCon_MobileNet.csv
+
+hyperparameters:
+  batch_size: 640             # Stable SupCon batch for RTX 2080 Ti (two views = 1280 samples)
+  lr: 0.17                    # Scaled LR for the larger batch (was 0.15 @ 512)
+  epochs: 600                 # Will be overridden by schedule
+  momentum: 0.9
+  temperature: 0.07           # SupCon temperature (lower than SimCLR)
+  num_workers: 8
+  val_split: 0.0              # Use full training set for contrastive learning
+  image_size: 32              # CIFAR-10 size
+  projection_dim: 128         # Output dimension for contrastive learning
+  projection_hidden_dim: 2048 # Hidden dimension in projection head
+  projection_use_bn: true
+  use_gaussian_blur: true     # Gaussian blur augmentation for SupCon
+  simclr_reference_transforms: true
+  linear_subset_per_class: null
+  linear_subset_seed: 42
+

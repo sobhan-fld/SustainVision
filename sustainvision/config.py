@@ -88,6 +88,18 @@ class TrainingConfig:
     )
     gradient_clip_norm: Optional[float] = None
     mixed_precision: bool = False
+    quantization: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "approach": "dynamic",
+            "dtype": "qint8",
+            "modules": ["Linear"],
+            "backend": "qnnpack",
+            "export_format": "torchscript",
+            "artifact_name": None,
+            "custom": False,
+        }
+    )
     save_model: bool = False
     save_model_path: str = "outputs/checkpoints"
     checkpoint_path: Optional[str] = None
@@ -194,6 +206,11 @@ class ConfigManager:
             incoming_schedule = merged.get("simclr_schedule") or {}
             merged["simclr_schedule"] = {**default_schedule, **incoming_schedule}
 
+            # Merge quantization settings
+            default_quant = default_dict.get("quantization", {}) or {}
+            incoming_quant = merged.get("quantization") or {}
+            merged["quantization"] = {**default_quant, **incoming_quant}
+
             self._config = TrainingConfig(**merged)
         return self._config
 
@@ -222,6 +239,7 @@ class ConfigManager:
         freeze_backbone: Optional[bool] = None,
         report_filename: Optional[str] = None,
         early_stopping: Optional[Dict[str, Any]] = None,
+        quantization: Optional[Dict[str, Any]] = None,
         simclr_schedule: Optional[Dict[str, Any]] = None,
         hyperparameters: Optional[Dict[str, Any]] = None,
     ) -> None:
@@ -284,6 +302,10 @@ class ConfigManager:
             self._config.early_stopping = merged
         if report_filename is not None:
             self._config.report_filename = report_filename
+        if quantization is not None:
+            current_quant = self._config.quantization or {}
+            merged_quant = {**current_quant, **quantization}
+            self._config.quantization = merged_quant
         if simclr_schedule is not None:
             merged = {**self._config.simclr_schedule, **simclr_schedule}
             self._config.simclr_schedule = merged

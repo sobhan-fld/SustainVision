@@ -192,6 +192,7 @@ Configuration Reference
 - `scheduler`: Learning rate scheduler descriptor (`type` + `params`)
 - `gradient_clip_norm`: Optional gradient clipping threshold
 - `mixed_precision`: Toggle automatic mixed precision (AMP)
+- `quantization`: Optional quantized export configuration (enable/disable, approach, dtype, backend, artifact format)
 - `save_model`: `True/False` to store the trained weights after each run
 - `save_model_path`: Directory where checkpoints are written (default `artifacts/`)
 - `checkpoint_path`: Optional path to a checkpoint file for fine-tuning (leave empty for training from scratch)

@@ -468,6 +468,95 @@ def _ask_simclr_schedule(schedule: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _ask_quantization_settings(current: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Prompt for optional quantization export settings."""
+
+    current = current or {}
+    enabled = questionary.confirm(
+        "Export a quantized model artifact after training?",
+        default=bool(current.get("enabled", False)),
+    ).ask()
+    if enabled is None:
+        enabled = current.get("enabled", False)
+
+    if not enabled:
+        return {**current, "enabled": False, "custom": False}
+
+    customize = questionary.confirm(
+        "Customize quantization parameters (experimental)?",
+        default=bool(current.get("custom", False)),
+    ).ask()
+    if customize is None:
+        customize = current.get("custom", False)
+
+    quant_cfg: Dict[str, Any] = {**current, "enabled": True, "custom": bool(customize)}
+
+    if not quant_cfg["custom"]:
+        # Keep defaults; just ensure backend/dtype/module defaults are populated.
+        quant_cfg.setdefault("approach", "dynamic")
+        quant_cfg.setdefault("dtype", "qint8")
+        quant_cfg.setdefault("modules", ["Linear"])
+        quant_cfg.setdefault("backend", "qnnpack")
+        quant_cfg.setdefault("export_format", "torchscript")
+        quant_cfg.setdefault("artifact_name", None)
+        return quant_cfg
+
+    approach = questionary.select(
+        "Quantization approach:",
+        choices=["dynamic"],
+        default=str(current.get("approach", "dynamic")),
+    ).ask()
+
+    dtype = questionary.select(
+        "Quantization dtype:",
+        choices=["qint8", "float16"],
+        default=str(current.get("dtype", "qint8")),
+    ).ask()
+
+    backend = questionary.select(
+        "Quantized backend:",
+        choices=["qnnpack", "fbgemm"],
+        default=str(current.get("backend", "qnnpack")),
+    ).ask()
+
+    modules_default = ", ".join(current.get("modules", ["Linear"]))
+    modules_text = questionary.text(
+        "Module types to quantize (comma separated, e.g., Linear,Conv2d):",
+        default=modules_default,
+    ).ask()
+
+    export_format = questionary.select(
+        "Quantized artifact format:",
+        choices=[
+            questionary.Choice(title="TorchScript (.ts)", value="torchscript"),
+            questionary.Choice(title="State dict (.pt)", value="state_dict"),
+            questionary.Choice(title="Pickled module (.pt)", value="module"),
+        ],
+        default=str(current.get("export_format", "torchscript")),
+    ).ask()
+
+    artifact_name = questionary.text(
+        "Custom file name (leave empty to auto-generate):",
+        default=str(current.get("artifact_name", "") or ""),
+    ).ask()
+
+    modules = [m.strip() for m in (modules_text or "").split(",") if m and m.strip()]
+    if not modules:
+        modules = ["Linear"]
+
+    quant_cfg.update(
+        {
+            "approach": approach or "dynamic",
+            "dtype": dtype or "qint8",
+            "backend": backend or "qnnpack",
+            "modules": modules,
+            "export_format": export_format or "torchscript",
+            "artifact_name": (artifact_name.strip() or None) if artifact_name else None,
+        }
+    )
+    return quant_cfg
+
+
 def run_config_tui(config_path: str | None = None) -> TrainingConfig:
     """Run the interactive configuration flow and persist the result.
 
@@ -488,6 +577,7 @@ def run_config_tui(config_path: str | None = None) -> TrainingConfig:
     print(f"- scheduler: {cfg.scheduler}")
     print(f"- gradient_clip_norm: {cfg.gradient_clip_norm}")
     print(f"- mixed_precision: {cfg.mixed_precision}")
+    print(f"- quantization: {getattr(cfg, 'quantization', {})}")
     print(f"- report_filename: {cfg.report_filename}")
     print(f"- simclr_schedule: {cfg.simclr_schedule}")
     print(f"- hyperparameters: {cfg.hyperparameters}")
@@ -577,6 +667,7 @@ def run_config_tui(config_path: str | None = None) -> TrainingConfig:
         if mode_answer is not None:
             early_mode = mode_answer
     new_simclr_schedule = _ask_simclr_schedule(cfg.simclr_schedule)
+    new_quantization = _ask_quantization_settings(getattr(cfg, "quantization", {}))
 
     cm.set(
         model=new_model,
@@ -600,6 +691,7 @@ def run_config_tui(config_path: str | None = None) -> TrainingConfig:
             "mode": early_mode,
         },
         report_filename=report_name,
+        quantization=new_quantization,
         simclr_schedule=new_simclr_schedule,
         hyperparameters=new_hp,
     )

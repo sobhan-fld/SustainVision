@@ -22,7 +22,7 @@ from dataclasses import dataclass, asdict
 import logging
 import yaml
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 from .config import TrainingConfig
 from .data import DatasetPreparationError, build_classification_dataloaders
@@ -42,6 +42,11 @@ except Exception:  # pragma: no cover - handled at runtime
     torch = None  # type: ignore
     nn = None  # type: ignore
     amp = None  # type: ignore
+
+try:
+    import torch.ao.quantization as ao_quant
+except Exception:  # pragma: no cover - handled at runtime
+    ao_quant = None  # type: ignore
 
 try:
     from codecarbon import EmissionsTracker
@@ -71,6 +76,120 @@ def _ensure_dependencies() -> None:
             "CodeCarbon is required to record emissions. Install it with "
             "`pip install codecarbon`."
         )
+
+
+def _resolve_quant_module_types(module_names: Any) -> "Set[type]":
+    """Convert user-specified module names into actual nn.Module classes."""
+
+    resolved: Set[type] = set()
+    if nn is None or module_names is None:
+        return resolved
+
+    if not isinstance(module_names, (list, tuple, set)):
+        module_iterable = [module_names]
+    else:
+        module_iterable = module_names
+
+    for entry in module_iterable:
+        if entry is None:
+            continue
+        if isinstance(entry, str):
+            candidate = getattr(nn, entry, None)  # type: ignore[attr-defined]
+            if isinstance(candidate, type) and issubclass(candidate, nn.Module):  # type: ignore[arg-type]
+                resolved.add(candidate)  # type: ignore[arg-type]
+        elif isinstance(entry, type) and issubclass(entry, nn.Module):  # type: ignore[arg-type]
+            resolved.add(entry)  # type: ignore[arg-type]
+    return resolved
+
+
+def _export_quantized_artifact(
+    model: "nn.Module",  # type: ignore[name-defined]
+    config: TrainingConfig,
+    quant_cfg: Dict[str, Any],
+    *,
+    artifact_dir: Path,
+    report_path: Path,
+    image_size: int,
+) -> Optional[Path]:
+    """Apply dynamic quantization and export an artifact for inference."""
+
+    if torch is None or nn is None or ao_quant is None:
+        print("[warn] Quantization requested but torch.ao.quantization is unavailable.")
+        return None
+
+    if not quant_cfg.get("enabled"):
+        return None
+
+    approach = str(quant_cfg.get("approach") or quant_cfg.get("mode") or "dynamic").lower()
+    if approach not in {"dynamic"}:
+        print(f"[warn] Quantization approach '{approach}' is not supported. Falling back to dynamic quantization.")
+        approach = "dynamic"
+
+    backend = str(quant_cfg.get("backend", "qnnpack")).lower()
+    if hasattr(torch, "backends") and hasattr(torch.backends, "quantized"):
+        try:
+            if backend in {"qnnpack", "fbgemm"}:
+                torch.backends.quantized.engine = backend  # type: ignore[attr-defined]
+        except Exception as exc:  # pragma: no cover - backend guard
+            print(f"[warn] Unable to set quantized backend '{backend}': {exc}")
+
+    dtype_map = {
+        "qint8": torch.qint8,
+        "quint8": torch.quint8,
+        "float16": torch.float16,
+    }
+    dtype = dtype_map.get(str(quant_cfg.get("dtype", "qint8")).lower(), torch.qint8)
+
+    module_types = _resolve_quant_module_types(quant_cfg.get("modules") or ["Linear"])
+    if not module_types:
+        module_types = {nn.Linear}
+
+    quant_model = copy.deepcopy(model).cpu().eval()
+    try:
+        quantized = ao_quant.quantize_dynamic(quant_model, module_types, dtype=dtype)
+    except Exception as exc:
+        print(f"[warn] Dynamic quantization failed: {exc}")
+        return None
+
+    export_format = str(quant_cfg.get("export_format", "torchscript")).lower()
+    base_name = quant_cfg.get("artifact_name") or f"{report_path.stem}_quantized"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    quant_path: Optional[Path] = None
+    metadata = {
+        "quantization": quant_cfg,
+        "config": asdict(config),
+    }
+
+    if export_format == "state_dict":
+        quant_path = artifact_dir / f"{base_name}.pt"
+        torch.save(
+            {
+                **metadata,
+                "model_state": quantized.state_dict(),
+            },
+            quant_path,
+        )
+    elif export_format == "module":
+        quant_path = artifact_dir / f"{base_name}.pt"
+        torch.save({**metadata, "model": quantized}, quant_path)
+    else:
+        example = torch.randn(1, 3, image_size, image_size)
+        try:
+            scripted = torch.jit.trace(quantized, example)
+            quant_path = artifact_dir / f"{base_name}.ts"
+            scripted.save(str(quant_path))
+        except Exception as exc:
+            fallback = artifact_dir / f"{base_name}.pt"
+            torch.save({**metadata, "model": quantized}, fallback)
+            quant_path = fallback
+            print(
+                "[warn] TorchScript export failed "
+                f"({exc}). Saved a pickled quantized module instead: {fallback}"
+            )
+
+    print(f"[info] Quantized artifact saved to {quant_path}")
+    return quant_path
 
 
 
@@ -145,6 +264,7 @@ def _execute_training_phase(
     project_dir = project_root or (Path.cwd() / "outputs")
     project_dir.mkdir(parents=True, exist_ok=True)
     report_path = unique_report_path(project_dir, config.report_filename)
+    artifact_dir = Path(config.save_model_path or "artifacts")
 
     device = resolve_device(config.device)
 
@@ -170,6 +290,7 @@ def _execute_training_phase(
         if simclr_recipe_override is not None
         else bool(config.hyperparameters.get("simclr_reference_transforms", False))
     )
+    quant_cfg = config.quantization or {}
     subset_per_class = subset_per_class_override
     if subset_per_class is None:
         subset_per_class = config.hyperparameters.get("linear_subset_per_class")
@@ -298,10 +419,14 @@ def _execute_training_phase(
 
     use_amp = bool(config.mixed_precision) and device.type == "cuda" and amp is not None
     scaler = None
-    if use_amp and torch is not None and hasattr(torch, "amp"):
-        scaler = torch.amp.GradScaler("cuda", enabled=True)
-    elif use_amp and amp is not None:
-        scaler = amp.GradScaler(enabled=True)
+    autocast_factory = None
+    if use_amp:
+        if torch is not None and hasattr(torch, "amp"):
+            scaler = torch.amp.GradScaler("cuda", enabled=True)
+            autocast_factory = lambda: torch.amp.autocast("cuda")  # type: ignore[call-arg]
+        elif amp is not None:
+            scaler = amp.GradScaler(enabled=True)
+            autocast_factory = getattr(amp, "autocast", None)
 
     tracker = None
     if not skip_emissions_tracker:
@@ -387,8 +512,10 @@ def _execute_training_phase(
 
                 optimizer.zero_grad()
 
-                if use_amp and scaler is not None:
-                    with amp.autocast():  # type: ignore[attr-defined]
+                optimizer_step_done = False
+
+                if use_amp and scaler is not None and autocast_factory is not None:
+                    with autocast_factory():  # type: ignore[call-arg]
                         logits, embeddings = model(inputs)
                         loss = compute_loss(loss_spec, logits, embeddings, labels, temperature)
                     scaler.scale(loss).backward()
@@ -397,8 +524,7 @@ def _execute_training_phase(
                         torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
                     scaler.step(optimizer)
                     scaler.update()
-                    if scheduler is not None and scheduler_step_on_batch:
-                        scheduler.step()
+                    optimizer_step_done = True
                 else:
                     logits, embeddings = model(inputs)
                     loss = compute_loss(loss_spec, logits, embeddings, labels, temperature)
@@ -406,8 +532,10 @@ def _execute_training_phase(
                     if config.gradient_clip_norm is not None:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip_norm)
                     optimizer.step()
-                    if scheduler is not None and scheduler_step_on_batch:
-                        scheduler.step()
+                    optimizer_step_done = True
+
+                if scheduler is not None and scheduler_step_on_batch and optimizer_step_done:
+                    scheduler.step()
 
                 batch_weight = float(inputs.size(0)) if contrastive_mode else 1.0
                 epoch_loss += loss.item() * batch_weight
@@ -544,8 +672,8 @@ def _execute_training_phase(
                 f"({early_metric}={best_metric:.4f})."
             )
 
+    quantized_artifact: Optional[Path] = None
     if config.save_model:
-        artifact_dir = Path(config.save_model_path or "artifacts")
         artifact_dir.mkdir(parents=True, exist_ok=True)
         base_name = f"{report_path.stem}_model.pt"
         model_path = artifact_dir / base_name
@@ -567,6 +695,16 @@ def _execute_training_phase(
 
         print(f"[info] Model checkpoint saved to {model_path}")
         print(f"[info] Config snapshot written to {config_yaml_path}")
+
+    if quant_cfg.get("enabled") and write_outputs:
+        quantized_artifact = _export_quantized_artifact(
+            model,
+            config,
+            quant_cfg,
+            artifact_dir=artifact_dir,
+            report_path=report_path,
+            image_size=image_size,
+        )
 
     duration = time.perf_counter() - start_time
     energy_kwh = None
@@ -595,6 +733,7 @@ def _execute_training_phase(
         energy_kwh=energy_kwh,
         duration_seconds=duration,
         epochs=epoch_metrics,
+        quantized_model_path=quantized_artifact,
     ), {
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),

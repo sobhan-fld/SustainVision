@@ -37,6 +37,8 @@ def _start_training(cm: ConfigManager) -> None:
         print(f"- energy (kWh): {summary.energy_kwh:.6f}")
     if summary.duration_seconds is not None:
         print(f"- duration (s): {summary.duration_seconds:.2f}")
+    if summary.quantized_model_path is not None:
+        print(f"- quantized model: {summary.quantized_model_path}")
 
 
 def _show_devices() -> None:

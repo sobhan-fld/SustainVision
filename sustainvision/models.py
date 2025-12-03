@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Sequence, Union
 
 try:
     from torch import nn
@@ -14,6 +14,40 @@ except Exception:
     F = None  # type: ignore
     torch = None  # type: ignore
     tv_models = None  # type: ignore
+
+
+Selector = Union[int, str]
+
+
+def _safe_get_submodule(root: "nn.Module", path: Sequence[Selector]):  # type: ignore[name-defined]
+    """Safely navigate into nested Sequential/attribute structures."""
+    module = root
+    for key in path:
+        try:
+            if isinstance(key, int):
+                module = module[key]  # type: ignore[index]
+            else:
+                module = getattr(module, key)
+        except Exception:
+            return None
+    return module
+
+
+def _adapt_mobilenet_for_small_images(backbone: "nn.Module", image_size: int) -> None:  # type: ignore[name-defined]
+    """Reduce initial downsampling so 32x32 inputs don't collapse to 1x1."""
+    if image_size > 64 or not hasattr(backbone, "features"):
+        return
+
+    features = backbone.features  # type: ignore[attr-defined]
+    adjustments = [
+        (0, 0),  # first stem conv
+        (1, "block", 0, 0),  # first depthwise conv
+        (2, "block", 1, 0),  # second block depthwise conv
+    ]
+    for path in adjustments:
+        conv = _safe_get_submodule(features, path)
+        if isinstance(conv, nn.Conv2d):
+            conv.stride = (1, 1)
 
 
 class ProjectionModel(nn.Module):  # type: ignore[name-defined]
@@ -159,6 +193,7 @@ def build_model(
             )
         if key == "mobilenet_v3_small":
             backbone = tv_models.mobilenet_v3_small(weights=None)
+            _adapt_mobilenet_for_small_images(backbone, image_size)
             feature_dim = backbone.classifier[-1].in_features
             backbone.classifier[-1] = nn.Identity()
             return ProjectionModel(

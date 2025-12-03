@@ -34,4 +34,5 @@ class TrainingRunSummary:
     energy_kwh: Optional[float]
     duration_seconds: Optional[float]
     epochs: List[EpochMetrics]
+    quantized_model_path: Optional[Path] = None
 
