@@ -53,11 +53,11 @@ simclr_schedule:
 report_filename: SupCon_MobileNetLarge/SupCon_MobileNetLarge.csv
 
 hyperparameters:
-  batch_size: 512             # Conservative batch for large backbone (two views = 1024 samples)
+  batch_size: 384             # Slightly smaller batch to add gradient noise
   lr: 0.2                     # Base LR for SGD + cosine schedule
   epochs: 600                 # Will be overridden by schedule
   momentum: 0.9
-  temperature: 0.05           # Sharper similarities for MobileNet architectures
+  temperature: 0.04           # Lower temperature for more contrastive signal
   num_workers: 8
   val_split: 0.0              # Use full training set for contrastive learning
   image_size: 32              # CIFAR-10 size
