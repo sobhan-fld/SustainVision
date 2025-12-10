@@ -41,6 +41,41 @@ def _start_training(cm: ConfigManager) -> None:
         print(f"- quantized model: {summary.quantized_model_path}")
 
 
+def _choose_and_run_config(configs_dir: Path) -> None:
+    """Allow user to pick a YAML config from a directory and run it."""
+
+    configs_dir = configs_dir if configs_dir.is_absolute() else Path.cwd() / configs_dir
+    if not configs_dir.is_dir():
+        print(f"\n[error] Configs directory not found: {configs_dir}\n")
+        return
+
+    yaml_files = sorted(list(configs_dir.glob("*.yaml")) + list(configs_dir.glob("*.yml")))
+    if not yaml_files:
+        print(f"\n[error] No YAML configs found in {configs_dir}\n")
+        return
+
+    choices = [f"{idx}: {p.relative_to(Path.cwd())}" for idx, p in enumerate(yaml_files)]
+    selection = questionary.select(
+        "Select a config to run:",
+        choices=choices,
+    ).ask()
+
+    if selection is None:
+        return
+
+    try:
+        selected_idx = int(selection.split(":")[0])
+    except Exception:
+        print("\n[error] Invalid selection.\n")
+        return
+
+    if selected_idx < 0 or selected_idx >= len(yaml_files):
+        print("\n[error] Selection out of range.\n")
+        return
+
+    config_path = str(yaml_files[selected_idx])
+    cm = ConfigManager(config_path)
+    _start_training(cm)
 def _show_devices() -> None:
     """Print available CPU/GPU devices and basic utilization info."""
 
@@ -111,6 +146,7 @@ def main() -> None:
             "Select an action:",
             choices=[
                 "Start training",
+                "Run config from configs/",
                 "Configure settings",
                 "Download databases",
                 "Inspect devices",
@@ -125,6 +161,8 @@ def main() -> None:
             cm.load()  # refresh in-memory config after edits
         elif choice == "Start training":
             _start_training(cm)
+        elif choice == "Run config from configs/":
+            _choose_and_run_config(Path("configs"))
         elif choice == "Download databases":
             dataset_path = prompt_and_download(Path.cwd())
             if dataset_path is not None:

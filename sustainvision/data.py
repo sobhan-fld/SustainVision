@@ -77,6 +77,12 @@ def download_dataset(dataset: str, *, project_root: Optional[Path] = None) -> Pa
         torchvision_datasets.CIFAR10(root=str(target), download=True)
         return target
 
+    if name == "cifar100":
+        target = root / "cifar100"
+        _prepare_root(target)
+        torchvision_datasets.CIFAR100(root=str(target), download=True)
+        return target
+
     if name == "mnist":
         target = root / "mnist"
         _prepare_root(target)
@@ -91,12 +97,7 @@ def prompt_and_download(project_root: Optional[Path] = None) -> Optional[Path]:
 
     choice = questionary.select(
         "Select a dataset to download:",
-        choices=[
-            "CIFAR10",
-            "MNIST",
-            "Synthetic placeholder",
-            "Cancel",
-        ],
+        choices=["CIFAR10", "CIFAR100", "MNIST", "Synthetic placeholder", "Cancel"],
         default="CIFAR10",
     ).ask()
 
@@ -105,6 +106,7 @@ def prompt_and_download(project_root: Optional[Path] = None) -> Optional[Path]:
 
     mapping = {
         "CIFAR10": "cifar10",
+        "CIFAR100": "cifar100",
         "MNIST": "mnist",
         "Synthetic placeholder": "synthetic",
     }
@@ -138,6 +140,7 @@ def _resolve_dataset_source(database: str, root: Path) -> Tuple[str, Path]:
 
     known_roots = {
         "cifar10": root / "databases" / "cifar10",
+        "cifar100": root / "databases" / "cifar100",
         "mnist": root / "databases" / "mnist",
     }
 
@@ -151,11 +154,13 @@ def _resolve_dataset_source(database: str, root: Path) -> Tuple[str, Path]:
     if candidate.exists():
         if (candidate / "cifar-10-batches-py").exists():
             return "cifar10", candidate
+        if (candidate / "cifar-100-python").exists():
+            return "cifar100", candidate
         if (candidate / "MNIST").exists() or any(p.name.startswith("t10k") for p in candidate.glob("*")):
             return "mnist", candidate
         return "imagefolder", candidate
 
-    if lower in {"cifar10", "mnist"}:
+    if lower in {"cifar10", "cifar100", "mnist"}:
         return lower, known_roots[lower]
 
     raise DatasetPreparationError(
@@ -208,7 +213,7 @@ def build_classification_dataloaders(
     subset_seed = subset_seed or seed
 
     def _norm(dataset: str) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
-        if dataset == "cifar10":
+        if dataset in {"cifar10", "cifar100"}:
             return (0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)
         if dataset == "mnist":
             return (0.1307, 0.1307, 0.1307), (0.3081, 0.3081, 0.3081)
@@ -274,7 +279,7 @@ def build_classification_dataloaders(
         return Subset(dataset, selected)
 
     def _base_transforms(train: bool) -> transforms.Compose:
-        if dataset_kind == "cifar10" and simclr_recipe:
+        if dataset_kind in {"cifar10", "cifar100"} and simclr_recipe:
             if contrastive:
                 return _simclr_contrastive_transform()
             return _simclr_linear_transform(train)
@@ -310,7 +315,7 @@ def build_classification_dataloaders(
                 ]
             )
         ops.append(transforms.ToTensor())
-        if not (dataset_kind == "cifar10" and simclr_recipe):
+        if not (dataset_kind in {"cifar10", "cifar100"} and simclr_recipe):
             ops.append(transforms.Normalize(mean, std))
         return transforms.Compose(ops)
 
@@ -363,6 +368,46 @@ def build_classification_dataloaders(
         else:
             train_dataset = train_base
             val_dataset = tv_datasets.CIFAR10(
+                root=str(dataset_path),
+                train=False,
+                transform=None if contrastive else _base_transforms(train=False),
+                download=False,
+            )
+
+        if contrastive:
+            train_dataset = _wrap_contrastive(train_dataset, train_transform)
+            val_dataset = _wrap_contrastive(val_dataset, train_transform)
+
+    elif dataset_kind == "cifar100":
+        train_transform = _base_transforms(train=True)
+        cifar_train_transform = None if contrastive else train_transform
+        train_base = tv_datasets.CIFAR100(
+            root=str(dataset_path),
+            train=True,
+            transform=cifar_train_transform,
+            download=False,
+        )
+        num_classes = 100
+
+        if val_split > 0:
+            val_transform = _base_transforms(train=True if contrastive else False)
+            val_base = tv_datasets.CIFAR100(
+                root=str(dataset_path),
+                train=True,
+                transform=None if contrastive else _base_transforms(train=False),
+                download=False,
+            )
+            total = len(train_base)
+            val_count = max(1, int(total * val_split))
+            train_count = total - val_count
+            indices = torch.randperm(total, generator=generator)
+            train_indices = indices[:train_count]
+            val_indices = indices[train_count:]
+            train_dataset = Subset(train_base, train_indices.tolist())
+            val_dataset = Subset(val_base, val_indices.tolist())
+        else:
+            train_dataset = train_base
+            val_dataset = tv_datasets.CIFAR100(
                 root=str(dataset_path),
                 train=False,
                 transform=None if contrastive else _base_transforms(train=False),
