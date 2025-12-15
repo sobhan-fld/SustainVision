@@ -548,7 +548,14 @@ def _execute_training_phase(
         scheduler_cfg_copy["params"] = scheduler_params
     scheduler = build_scheduler(scheduler_cfg_copy, optimizer) if scheduler_cfg_copy else None
 
-    use_amp = bool(config.mixed_precision) and device.type == "cuda" and amp is not None
+    # AMP can be numerically fragile for contrastive objectives (SimCLR/SupCon),
+    # so we only enable it for standard classification losses by default.
+    use_amp = (
+        bool(config.mixed_precision)
+        and device.type == "cuda"
+        and amp is not None
+        and not contrastive_mode
+    )
     scaler = None
     autocast_factory = None
     if use_amp:
