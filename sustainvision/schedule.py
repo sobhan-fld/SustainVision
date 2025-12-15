@@ -25,11 +25,6 @@ try:
 except Exception:
     torch = None  # type: ignore
 
-try:
-    from codecarbon import EmissionsTracker
-except Exception:
-    EmissionsTracker = None  # type: ignore
-
 
 def _parse_schedule_config(config: TrainingConfig) -> Dict[str, Any]:
     """Extract and parse schedule configuration parameters."""
@@ -69,21 +64,6 @@ def _print_schedule_info(params: Dict[str, Any]) -> None:
     print(f"  - Reset optimizer: {params['optimizer_reset']}\n")
 
 
-def _setup_emissions_tracker(report_path: Path) -> Any:
-    """Initialize and start emissions tracker for the entire schedule run."""
-    if EmissionsTracker is None:
-        raise RuntimeError("CodeCarbon is required for emissions tracking")
-    
-    logging.getLogger("codecarbon").setLevel(logging.WARNING)
-    tracker = EmissionsTracker(
-        measure_power_secs=5,
-        project_name=report_path.stem,
-        log_level="warning",
-    )  # type: ignore[call-arg]
-    tracker.start()
-    return tracker
-
-
 def _adjust_epoch_numbers(
     metrics: List[EpochMetrics],
     start_epoch: int,
@@ -116,7 +96,7 @@ def _run_pretrain_phase(
         epochs_override=params["pretrain_epochs"],
         lr_override=None,  # Use base LR from config
         freeze_backbone_override=False,
-        skip_emissions_tracker=True,
+        skip_emissions_tracker=False,
         scheduler_config_override=None,
         simclr_recipe_override=params["use_reference_transforms"],
     )
@@ -148,7 +128,7 @@ def _run_finetune_phase(
         optimizer_override=params.get("finetune_optimizer"),
         weight_decay_override=params.get("finetune_weight_decay"),
         freeze_backbone_override=params["freeze_backbone"],
-        skip_emissions_tracker=True,
+        skip_emissions_tracker=False,
         reset_classifier=params["freeze_backbone"],
         scheduler_config_override=None,
         simclr_recipe_override=params["use_reference_transforms"],
@@ -205,7 +185,7 @@ def _run_single_cycle(
     """Run one complete cycle: pretrain + finetune.
     
     Returns:
-        Updated model state dictionary.
+        Tuple of (updated model state dictionary, emissions_kg, energy_kwh) for this cycle.
     """
     print(f"\n{'='*60}")
     print(f"Cycle {cycle}/{total_cycles}")
@@ -232,6 +212,15 @@ def _run_single_cycle(
     current_epoch_start = len(all_epoch_metrics) + 1
     _adjust_epoch_numbers(finetune_summary.epochs, current_epoch_start)
     all_epoch_metrics.extend(finetune_summary.epochs)
+
+    # Collect emissions/energy for this cycle from both phases (if available)
+    cycle_emissions_kg: Optional[float] = None
+    cycle_energy_kwh: Optional[float] = None
+    for summary in (pretrain_summary, finetune_summary):
+        if summary.emissions_kg is not None:
+            cycle_emissions_kg = (cycle_emissions_kg or 0.0) + float(summary.emissions_kg)
+        if summary.energy_kwh is not None:
+            cycle_energy_kwh = (cycle_energy_kwh or 0.0) + float(summary.energy_kwh)
     
     # Save checkpoint after finetune
     if config.save_model:
@@ -250,7 +239,7 @@ def _run_single_cycle(
         append=False,
     )
     
-    return model_state
+    return model_state, cycle_emissions_kg, cycle_energy_kwh
 
 
 def run_contrastive_schedule(
@@ -283,36 +272,28 @@ def run_contrastive_schedule(
     # Initialize tracking variables
     all_epoch_metrics: List[EpochMetrics] = []
     model_state: Optional[dict] = None
-    
-    # Setup emissions tracker for entire run
-    tracker = _setup_emissions_tracker(report_path)
+    total_emissions_kg: Optional[float] = None
+    total_energy_kwh: Optional[float] = None
     start_time = time.perf_counter()
     
-    try:
-        # Run all cycles
-        for cycle in range(1, params["cycles"] + 1):
-            model_state = _run_single_cycle(
-                config,
-                cycle,
-                params["cycles"],
-                params,
-                model_state,
-                all_epoch_metrics,
-                project_dir,
-                report_path,
-            )
+    # Run all cycles
+    for cycle in range(1, params["cycles"] + 1):
+        model_state, cycle_emissions_kg, cycle_energy_kwh = _run_single_cycle(
+            config,
+            cycle,
+            params["cycles"],
+            params,
+            model_state,
+            all_epoch_metrics,
+            project_dir,
+            report_path,
+        )
+        if cycle_emissions_kg is not None:
+            total_emissions_kg = (total_emissions_kg or 0.0) + float(cycle_emissions_kg)
+        if cycle_energy_kwh is not None:
+            total_energy_kwh = (total_energy_kwh or 0.0) + float(cycle_energy_kwh)
     
-    finally:
-        # Stop tracker and collect emissions data
-        total_emissions_kg = tracker.stop()
-        emissions_data = getattr(tracker, "final_emissions_data", None)
-        total_duration = time.perf_counter() - start_time
-        
-        total_energy_kwh = None
-        if emissions_data is not None:
-            total_energy_kwh = getattr(emissions_data, "energy_consumed", None)
-            if hasattr(emissions_data, "duration") and emissions_data.duration is not None:
-                total_duration = emissions_data.duration
+    total_duration = time.perf_counter() - start_time
     
     # Write final summary row with emissions
     write_report_csv(

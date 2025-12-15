@@ -202,8 +202,8 @@ def _log_resource_and_energy_snapshot(
     *,
     artifact_dir: Path,
     epoch: int,
-    tracker: Any,
-    start_time: float,
+    emissions_data: Any,
+    elapsed_seconds: float,
     device: Any,
 ) -> None:
     """Append a CSV row with energy + CPU/RAM/GPU stats every N epochs.
@@ -250,30 +250,24 @@ def _log_resource_and_energy_snapshot(
             gpu_util = None
             gpu_mem = None
 
-    # Try to query current cumulative energy/emissions from CodeCarbon (best-effort).
+    # Try to use the provided emissions data from CodeCarbon for this block.
     energy_kwh = None
     cpu_energy_kwh = None
     gpu_energy_kwh = None
     ram_energy_kwh = None
-    if tracker is not None:
+    if emissions_data is not None:
         try:
-            # Safest approach: inspect the internal emissions data list, which is how
-            # CodeCarbon aggregates measurements during a run. We never mutate it,
-            # we only read the latest snapshot.
-            emissions_list = getattr(tracker, "_emissions_data", None)
-            if isinstance(emissions_list, list) and emissions_list:
-                latest = emissions_list[-1]
-                energy_kwh = getattr(latest, "energy_consumed", None)
-                cpu_energy_kwh = getattr(latest, "cpu_energy", None)
-                gpu_energy_kwh = getattr(latest, "gpu_energy", None)
-                ram_energy_kwh = getattr(latest, "ram_energy", None)
+            energy_kwh = getattr(emissions_data, "energy_consumed", None)
+            cpu_energy_kwh = getattr(emissions_data, "cpu_energy", None)
+            gpu_energy_kwh = getattr(emissions_data, "gpu_energy", None)
+            ram_energy_kwh = getattr(emissions_data, "ram_energy", None)
         except Exception:
             energy_kwh = None
             cpu_energy_kwh = None
             gpu_energy_kwh = None
             ram_energy_kwh = None
 
-    elapsed = time.perf_counter() - start_time
+    elapsed = float(elapsed_seconds)
 
     log_path = artifact_dir / "resource_energy_log.csv"
     header = (
@@ -568,19 +562,9 @@ def _execute_training_phase(
             scaler = amp.GradScaler(enabled=True)
             autocast_factory = getattr(amp, "autocast", None)
 
-    tracker = None
-    if not skip_emissions_tracker:
-        logging.getLogger("codecarbon").setLevel(logging.WARNING)
-        tracker = EmissionsTracker(
-            measure_power_secs=5,
-            project_name=report_path.stem,
-            log_level="warning",
-        )  # type: ignore[call-arg]
-        tracker.start()
-
     epoch_metrics: List[EpochMetrics] = []
-    emissions_kg: Optional[float] = None
-    emissions_data: Any = None
+    emissions_kg_total: Optional[float] = None
+    energy_kwh_total: Optional[float] = None
 
     start_time = time.perf_counter()
 
@@ -621,7 +605,64 @@ def _execute_training_phase(
             print("[warn] tqdm is not installed. Using range instead.")
             pass
 
+        # We track energy in 10-epoch blocks. Each block gets its own CodeCarbon tracker
+        # so we can log per-block emissions and then aggregate a total at the end.
+        block_tracker: Any = None
+
+        def _start_block_tracker() -> Any:
+            """Start a new CodeCarbon tracker for a 10-epoch block."""
+            if skip_emissions_tracker or EmissionsTracker is None:
+                return None
+            logging.getLogger("codecarbon").setLevel(logging.WARNING)
+            local_tracker = EmissionsTracker(
+                measure_power_secs=5,
+                project_name=report_path.stem,
+                log_level="warning",
+            )  # type: ignore[call-arg]
+            local_tracker.start()
+            return local_tracker
+
+        def _stop_block_tracker(current_epoch: int) -> None:
+            """Stop the current block tracker, log stats, and update totals."""
+            nonlocal block_tracker, emissions_kg_total, energy_kwh_total
+            if block_tracker is None:
+                return
+            try:
+                block_kg = block_tracker.stop()
+                block_data = getattr(block_tracker, "final_emissions_data", None)
+            except Exception:
+                block_kg = None
+                block_data = None
+            block_tracker = None
+
+            # Aggregate totals
+            if block_kg is not None:
+                emissions_kg_total = (emissions_kg_total or 0.0) + float(block_kg)
+            if block_data is not None:
+                try:
+                    block_energy = getattr(block_data, "energy_consumed", None)
+                    if block_energy is not None:
+                        energy_kwh_total = (energy_kwh_total or 0.0) + float(block_energy)
+                except Exception:
+                    pass
+
+            # Log this block as a snapshot for the last epoch of the block
+            try:
+                _log_resource_and_energy_snapshot(
+                    artifact_dir=artifact_dir,
+                    epoch=current_epoch,
+                    emissions_data=block_data,
+                    elapsed_seconds=time.perf_counter() - start_time,
+                    device=device,
+                )
+            except Exception as exc:  # pragma: no cover - best-effort logging
+                print(f"[warn] Failed to record resource/energy snapshot at epoch {current_epoch}: {exc}")
+
         for epoch in epoch_iterable:
+            # Start a new 10-epoch energy tracking block at epochs 1, 11, 21, ...
+            if not skip_emissions_tracker and ((epoch - 1) % 10 == 0) and block_tracker is None:
+                block_tracker = _start_block_tracker()
+
             model.train()
             epoch_loss = 0.0
             loss_normalizer = 0.0
@@ -756,19 +797,6 @@ def _execute_training_phase(
             else:
                 print(message)
 
-            # Record resource and energy usage every 10 epochs into the artifact directory.
-            if epoch % 10 == 0:
-                try:
-                    _log_resource_and_energy_snapshot(
-                        artifact_dir=artifact_dir,
-                        epoch=epoch,
-                        tracker=tracker,
-                        start_time=start_time,
-                        device=device,
-                    )
-                except Exception as exc:  # pragma: no cover - logging is best-effort
-                    print(f"[warn] Failed to record resource/energy snapshot at epoch {epoch}: {exc}")
-
             metrics_map = {
                 "train_loss": train_loss,
                 "train_accuracy": train_acc,
@@ -805,18 +833,23 @@ def _execute_training_phase(
                             epoch_iterable.write(notice)
                         else:
                             print(notice)
+                        # End current block before breaking
+                        _stop_block_tracker(epoch)
                         break
+
+            # End of 10-epoch block or final epoch: stop tracker and log snapshot.
+            if epoch % 10 == 0 or epoch == epochs:
+                _stop_block_tracker(epoch)
 
         if use_tqdm and hasattr(epoch_iterable, "close"):
             epoch_iterable.close()
-
-        if tracker is not None:
-            emissions_kg = tracker.stop()
-            emissions_data = getattr(tracker, "final_emissions_data", None)
     finally:
-        if tracker is not None and emissions_kg is None:
-            emissions_kg = tracker.stop()
-            emissions_data = getattr(tracker, "final_emissions_data", None)
+        # Ensure any active block tracker is stopped if something goes wrong.
+        try:
+            if 'block_tracker' in locals() and block_tracker is not None:
+                _stop_block_tracker(epoch)  # type: ignore[name-defined]
+        except Exception:
+            pass
 
     if early_enabled and best_state is not None:
         model.load_state_dict(best_state["model"])
@@ -861,17 +894,13 @@ def _execute_training_phase(
         )
 
     duration = time.perf_counter() - start_time
-    energy_kwh = None
-    if emissions_data is not None:
-        energy_kwh = emissions_data.energy_consumed
-        if emissions_data.duration is not None:
-            duration = emissions_data.duration
+    energy_kwh = energy_kwh_total
 
     if write_outputs:
         write_report_csv(
             report_path,
             epoch_metrics,
-            emissions_kg=emissions_kg,
+            emissions_kg=emissions_kg_total,
             energy_kwh=energy_kwh,
             duration_seconds=duration,
             config=config,
@@ -883,7 +912,7 @@ def _execute_training_phase(
 
     return TrainingRunSummary(
         report_path=report_path,
-        emissions_kg=emissions_kg,
+        emissions_kg=emissions_kg_total,
         energy_kwh=energy_kwh,
         duration_seconds=duration,
         epochs=epoch_metrics,
