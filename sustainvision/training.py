@@ -257,14 +257,16 @@ def _log_resource_and_energy_snapshot(
     ram_energy_kwh = None
     if tracker is not None:
         try:
-            # Many CodeCarbon versions expose a `_prepare_emissions_data` helper returning EmissionsData.
-            prepare = getattr(tracker, "_prepare_emissions_data", None)
-            if callable(prepare):
-                data = prepare()
-                energy_kwh = getattr(data, "energy_consumed", None)
-                cpu_energy_kwh = getattr(data, "cpu_energy", None)
-                gpu_energy_kwh = getattr(data, "gpu_energy", None)
-                ram_energy_kwh = getattr(data, "ram_energy", None)
+            # Safest approach: inspect the internal emissions data list, which is how
+            # CodeCarbon aggregates measurements during a run. We never mutate it,
+            # we only read the latest snapshot.
+            emissions_list = getattr(tracker, "_emissions_data", None)
+            if isinstance(emissions_list, list) and emissions_list:
+                latest = emissions_list[-1]
+                energy_kwh = getattr(latest, "energy_consumed", None)
+                cpu_energy_kwh = getattr(latest, "cpu_energy", None)
+                gpu_energy_kwh = getattr(latest, "gpu_energy", None)
+                ram_energy_kwh = getattr(latest, "ram_energy", None)
         except Exception:
             energy_kwh = None
             cpu_energy_kwh = None
