@@ -53,6 +53,11 @@ try:
 except Exception:  # pragma: no cover - handled at runtime
     EmissionsTracker = None  # type: ignore
 
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    psutil = None  # type: ignore
+
 
 
 
@@ -193,6 +198,109 @@ def _export_quantized_artifact(
 
 
 
+def _log_resource_and_energy_snapshot(
+    *,
+    artifact_dir: Path,
+    epoch: int,
+    tracker: Any,
+    start_time: float,
+    device: Any,
+) -> None:
+    """Append a CSV row with energy + CPU/RAM/GPU stats every N epochs.
+
+    The log is written next to model checkpoints (save_model_path), so each run keeps
+    its own resource log.
+    """
+
+    # Best-effort: if psutil is not available we still try to log what we can.
+    cpu_percent = None
+    ram_percent = None
+    if psutil is not None:
+        try:
+            cpu_percent = float(psutil.cpu_percent(interval=None))
+            ram_percent = float(psutil.virtual_memory().percent)
+        except Exception:
+            cpu_percent = None
+            ram_percent = None
+
+    gpu_util = None
+    gpu_mem = None
+    if torch is not None and hasattr(torch, "cuda") and torch.cuda.is_available() and device is not None:
+        try:
+            gpu_index = getattr(device, "index", None)
+            if gpu_index is None and isinstance(device, torch.device):
+                gpu_index = device.index
+            if gpu_index is None and isinstance(device, str) and device.startswith("cuda:"):
+                try:
+                    gpu_index = int(device.split(":", 1)[1])
+                except Exception:
+                    gpu_index = 0
+            if gpu_index is None:
+                gpu_index = 0
+
+            handle = torch.cuda.device(gpu_index)
+            with handle:
+                util = torch.cuda.utilization(handle) if hasattr(torch.cuda, "utilization") else None  # type: ignore[attr-defined]
+                mem_alloc = torch.cuda.memory_allocated(gpu_index)
+                mem_total = torch.cuda.get_device_properties(gpu_index).total_memory
+
+            gpu_util = float(util) if util is not None else None
+            gpu_mem = float(mem_alloc) / float(mem_total) * 100.0 if mem_total else None
+        except Exception:
+            gpu_util = None
+            gpu_mem = None
+
+    # Try to query current cumulative energy/emissions from CodeCarbon (best-effort).
+    energy_kwh = None
+    cpu_energy_kwh = None
+    gpu_energy_kwh = None
+    ram_energy_kwh = None
+    if tracker is not None:
+        try:
+            # Many CodeCarbon versions expose a `_prepare_emissions_data` helper returning EmissionsData.
+            prepare = getattr(tracker, "_prepare_emissions_data", None)
+            if callable(prepare):
+                data = prepare()
+                energy_kwh = getattr(data, "energy_consumed", None)
+                cpu_energy_kwh = getattr(data, "cpu_energy", None)
+                gpu_energy_kwh = getattr(data, "gpu_energy", None)
+                ram_energy_kwh = getattr(data, "ram_energy", None)
+        except Exception:
+            energy_kwh = None
+            cpu_energy_kwh = None
+            gpu_energy_kwh = None
+            ram_energy_kwh = None
+
+    elapsed = time.perf_counter() - start_time
+
+    log_path = artifact_dir / "resource_energy_log.csv"
+    header = (
+        "epoch,elapsed_seconds,"
+        "energy_kwh,total_cpu_energy_kwh,total_gpu_energy_kwh,total_ram_energy_kwh,"
+        "cpu_percent,ram_percent,gpu_util_percent,gpu_mem_percent\n"
+    )
+    line = (
+        f"{epoch},{elapsed:.2f},"
+        f"{'' if energy_kwh is None else energy_kwh},"
+        f"{'' if cpu_energy_kwh is None else cpu_energy_kwh},"
+        f"{'' if gpu_energy_kwh is None else gpu_energy_kwh},"
+        f"{'' if ram_energy_kwh is None else ram_energy_kwh},"
+        f"{'' if cpu_percent is None else cpu_percent},"
+        f"{'' if ram_percent is None else ram_percent},"
+        f"{'' if gpu_util is None else gpu_util},"
+        f"{'' if gpu_mem is None else gpu_mem}\n"
+    )
+
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    if not log_path.exists():
+        with log_path.open("w", encoding="utf-8") as f:
+            f.write(header)
+            f.write(line)
+    else:
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(line)
+
+
 
 def train_model(
     config: TrainingConfig,
@@ -275,6 +383,7 @@ def _execute_training_phase(
     project_dir.mkdir(parents=True, exist_ok=True)
     report_path = unique_report_path(project_dir, config.report_filename)
     artifact_dir = Path(config.save_model_path or "artifacts")
+    artifact_dir.mkdir(parents=True, exist_ok=True)
 
     device = resolve_device(config.device)
 
@@ -638,6 +747,19 @@ def _execute_training_phase(
             else:
                 print(message)
 
+            # Record resource and energy usage every 10 epochs into the artifact directory.
+            if epoch % 10 == 0:
+                try:
+                    _log_resource_and_energy_snapshot(
+                        artifact_dir=artifact_dir,
+                        epoch=epoch,
+                        tracker=tracker,
+                        start_time=start_time,
+                        device=device,
+                    )
+                except Exception as exc:  # pragma: no cover - logging is best-effort
+                    print(f"[warn] Failed to record resource/energy snapshot at epoch {epoch}: {exc}")
+
             metrics_map = {
                 "train_loss": train_loss,
                 "train_accuracy": train_acc,
@@ -698,7 +820,6 @@ def _execute_training_phase(
 
     quantized_artifact: Optional[Path] = None
     if config.save_model:
-        artifact_dir.mkdir(parents=True, exist_ok=True)
         base_name = f"{report_path.stem}_model.pt"
         model_path = artifact_dir / base_name
         counter = 1
