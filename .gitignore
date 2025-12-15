@@ -11,3 +11,4 @@ outputs/
 emissions.csv
 training_report.csv
 logs/
+configs/
