@@ -610,7 +610,13 @@ def _execute_training_phase(
         block_tracker: Any = None
 
         def _start_block_tracker() -> Any:
-            """Start a new CodeCarbon tracker for a 10-epoch block."""
+            """Start a new CodeCarbon tracker for a 10-epoch block.
+
+            Note: We disable CodeCarbon's own CSV logging (`save_to_file=False`)
+            so that we don't create a global `emissions.csv`. Per-block and
+            total energy/emissions are instead captured via the tracker object
+            and our own `resource_energy_log.csv`.
+            """
             if skip_emissions_tracker or EmissionsTracker is None:
                 return None
             logging.getLogger("codecarbon").setLevel(logging.WARNING)
@@ -618,6 +624,7 @@ def _execute_training_phase(
                 measure_power_secs=5,
                 project_name=report_path.stem,
                 log_level="warning",
+                save_to_file=False,
             )  # type: ignore[call-arg]
             local_tracker.start()
             return local_tracker
