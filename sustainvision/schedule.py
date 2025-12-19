@@ -81,9 +81,14 @@ def _run_pretrain_phase(
     project_dir: Path,
     report_path: Path,
 ) -> Tuple[TrainingRunSummary, dict]:
-    """Run a single pretrain phase (contrastive learning)."""
+    """Run a single pretrain phase (contrastive learning).
+    
+    Always runs pretrain with unfrozen backbone. This allows the backbone
+    to continue improving across cycles, while periodic finetune phases
+    evaluate the backbone quality with a fresh linear head.
+    """
     pretrain_label = f"pretrain_cycle_{cycle}"
-    print(f"[info] Starting pretrain phase: {pretrain_label}")
+    print(f"[info] Starting pretrain phase: {pretrain_label} (backbone unfrozen)")
     
     summary, state = _execute_training_phase(
         config,
@@ -95,7 +100,7 @@ def _run_pretrain_phase(
         loss_function_override=params["pretrain_loss"],
         epochs_override=params["pretrain_epochs"],
         lr_override=None,  # Use base LR from config
-        freeze_backbone_override=False,
+        freeze_backbone_override=False,  # Always unfrozen during pretrain
         skip_emissions_tracker=False,
         scheduler_config_override=None,
         simclr_recipe_override=params["use_reference_transforms"],
@@ -111,9 +116,14 @@ def _run_finetune_phase(
     project_dir: Path,
     report_path: Path,
 ) -> Tuple[TrainingRunSummary, dict]:
-    """Run a single finetune phase (supervised learning)."""
+    """Run a single finetune phase (supervised learning).
+    
+    This phase evaluates the backbone quality by training a fresh linear head
+    with frozen backbone. After this phase, the backbone will be unfrozen again
+    in the next pretrain phase to continue improving.
+    """
     finetune_label = f"finetune_cycle_{cycle}"
-    print(f"[info] Starting finetune phase: {finetune_label}")
+    print(f"[info] Starting finetune phase: {finetune_label} (backbone frozen, evaluating representation quality)")
     
     summary, state = _execute_training_phase(
         config,
@@ -129,7 +139,7 @@ def _run_finetune_phase(
         weight_decay_override=params.get("finetune_weight_decay"),
         freeze_backbone_override=params["freeze_backbone"],
         skip_emissions_tracker=False,
-        reset_classifier=params["freeze_backbone"],
+        reset_classifier=params["freeze_backbone"],  # Reset classifier to evaluate backbone quality
         scheduler_config_override=None,
         simclr_recipe_override=params["use_reference_transforms"],
         subset_per_class_override=params.get("linear_subset_per_class"),
