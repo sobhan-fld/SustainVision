@@ -671,6 +671,9 @@ def _execute_training_phase(
                 block_tracker = _start_block_tracker()
 
             model.train()
+            # If backbone is frozen, keep it in eval mode (for proper BatchNorm behavior)
+            if freeze_backbone and hasattr(model, "backbone"):
+                model.backbone.eval()
             epoch_loss = 0.0
             loss_normalizer = 0.0
             correct = 0

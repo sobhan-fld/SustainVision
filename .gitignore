@@ -12,3 +12,4 @@ emissions.csv
 training_report.csv
 logs/
 configs/
+configs_laptop/
