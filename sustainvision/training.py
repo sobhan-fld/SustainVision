@@ -356,6 +356,8 @@ def _execute_training_phase(
     simclr_recipe_override: Optional[bool] = None,
     subset_per_class_override: Optional[int] = None,
     subset_seed_override: Optional[int] = None,
+    scheduler_state: Optional[dict] = None,
+    cumulative_scheduler_steps: Optional[int] = None,
 ) -> Tuple[TrainingRunSummary, dict]:
     """Train a toy model using the provided configuration.
 
@@ -536,13 +538,29 @@ def _execute_training_phase(
         except Exception:
             warmup_epochs_val = 0
         warmup_units = warmup_epochs_val * (steps_per_epoch if scheduler_step_on_batch else 1)
+        
+        # If cumulative_scheduler_steps is provided, use it for t_max calculation
+        # This allows the scheduler to continue across multiple cycles
+        if cumulative_scheduler_steps is not None and t_max_strategy == "per_batch":
+            # Use cumulative steps for t_max, but still account for warmup
+            cumulative_total = cumulative_scheduler_steps + total_units
+            scheduler_params["t_max"] = max(1, cumulative_total - max(0, warmup_units))
+        elif t_max_strategy == "per_batch":
+            scheduler_params["t_max"] = max(1, total_units - max(0, warmup_units))
+        
         if scheduler_type == "warmup_cosine":
             scheduler_params["warmup_steps"] = max(0, warmup_units)
             scheduler_params.setdefault("warmup_start_factor", 0.0)
-        if t_max_strategy == "per_batch":
-            scheduler_params["t_max"] = max(1, total_units - max(0, warmup_units))
         scheduler_cfg_copy["params"] = scheduler_params
     scheduler = build_scheduler(scheduler_cfg_copy, optimizer) if scheduler_cfg_copy else None
+    
+    # Load scheduler state if provided (for continuing across cycles)
+    if scheduler is not None and scheduler_state is not None:
+        try:
+            scheduler.load_state_dict(scheduler_state)
+            print(f"[info] Loaded scheduler state to continue from previous cycle")
+        except Exception as e:
+            print(f"[warn] Failed to load scheduler state: {e}. Starting with fresh scheduler.")
 
     # AMP can be numerically fragile for contrastive objectives (SimCLR/SupCon),
     # so we only enable it for standard classification losses by default.
@@ -930,5 +948,6 @@ def _execute_training_phase(
     ), {
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
     }
 

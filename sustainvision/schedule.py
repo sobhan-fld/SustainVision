@@ -80,15 +80,21 @@ def _run_pretrain_phase(
     model_state: Optional[dict],
     project_dir: Path,
     report_path: Path,
+    scheduler_state: Optional[dict] = None,
+    cumulative_scheduler_steps: Optional[int] = None,
 ) -> Tuple[TrainingRunSummary, dict]:
     """Run a single pretrain phase (contrastive learning).
     
     Always runs pretrain with unfrozen backbone. This allows the backbone
     to continue improving across cycles, while periodic finetune phases
     evaluate the backbone quality with a fresh linear head.
+    
+    The scheduler continues across pretrain cycles to enable continued learning.
     """
     pretrain_label = f"pretrain_cycle_{cycle}"
     print(f"[info] Starting pretrain phase: {pretrain_label} (backbone unfrozen)")
+    if cumulative_scheduler_steps is not None:
+        print(f"[info] Continuing scheduler from step {cumulative_scheduler_steps}")
     
     summary, state = _execute_training_phase(
         config,
@@ -104,6 +110,8 @@ def _run_pretrain_phase(
         skip_emissions_tracker=False,
         scheduler_config_override=None,
         simclr_recipe_override=params["use_reference_transforms"],
+        scheduler_state=scheduler_state,
+        cumulative_scheduler_steps=cumulative_scheduler_steps,
     )
     return summary, state
 
@@ -191,32 +199,54 @@ def _run_single_cycle(
     all_epoch_metrics: List[EpochMetrics],
     project_dir: Path,
     report_path: Path,
-) -> dict:
+    scheduler_state: Optional[dict] = None,
+    cumulative_scheduler_steps: Optional[int] = None,
+) -> Tuple[dict, Optional[int], Optional[dict]]:
     """Run one complete cycle: pretrain + finetune.
     
     Returns:
-        Tuple of (updated model state dictionary, emissions_kg, energy_kwh) for this cycle.
+        Tuple of (updated model state dictionary, updated cumulative_scheduler_steps, 
+                 updated scheduler_state, emissions_kg, energy_kwh) for this cycle.
     """
     print(f"\n{'='*60}")
     print(f"Cycle {cycle}/{total_cycles}")
     print(f"{'='*60}\n")
     
-    # Run pretrain phase
+    # Run pretrain phase (scheduler continues across pretrain cycles)
     pretrain_summary, pretrain_state = _run_pretrain_phase(
-        config, cycle, params, model_state, project_dir, report_path
+        config, cycle, params, model_state, project_dir, report_path,
+        scheduler_state=scheduler_state,
+        cumulative_scheduler_steps=cumulative_scheduler_steps,
     )
     model_state = pretrain_state.get("model_state")
+    scheduler_state = pretrain_state.get("scheduler_state")
+    
+    # Update cumulative steps from scheduler state
+    # The scheduler state contains 'last_epoch' which is the total steps taken
+    if scheduler_state is not None:
+        # For CosineAnnealingLR, state_dict contains 'last_epoch' which is the step count
+        # For Sequential schedulers (warmup_cosine), we need to check the last scheduler
+        if isinstance(scheduler_state, dict):
+            # Try to get last_epoch from the state
+            if "last_epoch" in scheduler_state:
+                cumulative_scheduler_steps = scheduler_state["last_epoch"]
+            elif "schedulers" in scheduler_state:
+                # Sequential scheduler - get last_epoch from the last scheduler
+                last_sched_state = scheduler_state["schedulers"][-1] if scheduler_state["schedulers"] else {}
+                cumulative_scheduler_steps = last_sched_state.get("last_epoch", cumulative_scheduler_steps or 0)
+    # If no scheduler state, cumulative_steps remains as passed (None or previous value)
     
     # Adjust epoch numbers and accumulate metrics
     current_epoch_start = len(all_epoch_metrics) + 1
     _adjust_epoch_numbers(pretrain_summary.epochs, current_epoch_start)
     all_epoch_metrics.extend(pretrain_summary.epochs)
     
-    # Run finetune phase
+    # Run finetune phase (scheduler resets for finetune - uses different LR)
     finetune_summary, finetune_state = _run_finetune_phase(
         config, cycle, params, model_state, project_dir, report_path
     )
     model_state = finetune_state.get("model_state")
+    # Don't update scheduler_state from finetune - it uses a different scheduler
     
     # Adjust epoch numbers and accumulate metrics
     current_epoch_start = len(all_epoch_metrics) + 1
@@ -249,7 +279,7 @@ def _run_single_cycle(
         append=False,
     )
     
-    return model_state, cycle_emissions_kg, cycle_energy_kwh
+    return model_state, cumulative_scheduler_steps, scheduler_state, cycle_emissions_kg, cycle_energy_kwh
 
 
 def run_contrastive_schedule(
@@ -282,13 +312,15 @@ def run_contrastive_schedule(
     # Initialize tracking variables
     all_epoch_metrics: List[EpochMetrics] = []
     model_state: Optional[dict] = None
+    scheduler_state: Optional[dict] = None
+    cumulative_scheduler_steps: Optional[int] = None
     total_emissions_kg: Optional[float] = None
     total_energy_kwh: Optional[float] = None
     start_time = time.perf_counter()
     
     # Run all cycles
     for cycle in range(1, params["cycles"] + 1):
-        model_state, cycle_emissions_kg, cycle_energy_kwh = _run_single_cycle(
+        model_state, cumulative_scheduler_steps, scheduler_state, cycle_emissions_kg, cycle_energy_kwh = _run_single_cycle(
             config,
             cycle,
             params["cycles"],
@@ -297,6 +329,8 @@ def run_contrastive_schedule(
             all_epoch_metrics,
             project_dir,
             report_path,
+            scheduler_state=scheduler_state,
+            cumulative_scheduler_steps=cumulative_scheduler_steps,
         )
         if cycle_emissions_kg is not None:
             total_emissions_kg = (total_emissions_kg or 0.0) + float(cycle_emissions_kg)
