@@ -114,10 +114,13 @@ def supcon_loss(
 ) -> "torch.Tensor":  # type: ignore[name-defined]
     """Compute Supervised Contrastive (SupCon) loss with two views per sample.
     
-    Fixed mask expansion to correctly identify positive pairs:
+    Implementation follows the standard SupCon formula:
     - Same sample's two views are always positive
     - Different samples of the same class are positive
     - Different classes are negative
+    
+    Features come in as [view1_all_samples, view2_all_samples] and are interleaved
+    to match the mask structure which expects [view1_sample1, view2_sample1, view1_sample2, view2_sample2, ...]
     """
     if torch is None or F is None:
         raise RuntimeError("PyTorch is required for SupCon loss")
@@ -131,62 +134,56 @@ def supcon_loss(
     if batch_size == 0:
         return embeddings.new_zeros(())
 
-    features = embeddings.view(batch_size, n_views, -1)
-    features = F.normalize(features, dim=2)
-
-    # Extract labels: [batch_size * 2] -> [batch_size] (one label per original sample)
-    labels_flat = labels.view(batch_size, n_views)[:, 0]
+    # Normalize embeddings
+    features = F.normalize(embeddings, dim=1)
     
-    # Create mask for same-class samples: [batch_size, batch_size]
-    # mask[i, j] = 1 if sample i and sample j have the same class
-    class_mask = torch.eq(labels_flat.unsqueeze(1), labels_flat.unsqueeze(0)).float().to(device)
-
-    # Flatten features: [batch_size, n_views, dim] -> [batch_size * n_views, dim]
-    # Order: [view1_sample1, view1_sample2, ..., view2_sample1, view2_sample2, ...]
-    contrast_feature = torch.cat(torch.unbind(features, dim=1), dim=0)
-    anchor_feature = contrast_feature
-    anchor_count = n_views
+    # Extract labels: [batch_size * 2] -> [batch_size] (one label per original sample)
+    # Labels come as [labels_all, labels_all], so we take first half
+    labels_flat = labels[:batch_size]
+    
+    # Interleave features to match mask structure
+    # Input: [view1_sample1, view1_sample2, ..., view2_sample1, view2_sample2, ...]
+    # Output: [view1_sample1, view2_sample1, view1_sample2, view2_sample2, ...]
+    # This ensures same-sample pairs are at positions (i, i+1) for i in [0, 2, 4, ...]
+    indices = torch.arange(batch_size * n_views, device=device)
+    indices = indices.view(n_views, batch_size).t().contiguous().view(-1)
+    features = features[indices]
 
     # Compute similarity matrix: [batch_size * n_views, batch_size * n_views]
-    logits = torch.matmul(anchor_feature, contrast_feature.T) / max(temperature, 1e-6)
+    logits = torch.matmul(features, features.T) / max(temperature, 1e-6)
     
-    # Mask out self-similarity (diagonal)
-    logits_mask = torch.ones_like(logits, device=device)
-    logits_mask = logits_mask - torch.eye(batch_size * n_views, device=device)
+    # Create mask for positive pairs
+    # 1. Same sample's two views (adjacent positions after interleaving)
+    # After interleaving, positions (2i, 2i+1) are the two views of sample i
+    same_sample_mask = torch.zeros(batch_size * n_views, batch_size * n_views, device=device)
+    for i in range(batch_size):
+        idx1 = i * n_views
+        idx2 = i * n_views + 1
+        same_sample_mask[idx1, idx2] = 1.0
+        same_sample_mask[idx2, idx1] = 1.0
     
-    # Expand class_mask to account for two views per sample
-    # We need to identify:
-    # 1. Same sample's two views (always positive) - use identity pattern
-    # 2. Same class across different samples (positive) - use class_mask
-    
-    # Create identity mask for same-sample pairs
-    # This creates: [[1,1,0,0,...], [1,1,0,0,...], [0,0,1,1,...], [0,0,1,1,...], ...]
-    same_sample_mask = torch.eye(batch_size, device=device).repeat_interleave(n_views, dim=0).repeat_interleave(n_views, dim=1)
-    
-    # Expand class_mask: repeat each row/col for the two views
-    # This ensures same-class samples are positive across views
-    expanded_class_mask = class_mask.repeat_interleave(n_views, dim=0).repeat_interleave(n_views, dim=1)
+    # 2. Same class across different samples
+    labels_expanded = labels_flat.repeat_interleave(n_views)  # [view1_label1, view2_label1, view1_label2, ...]
+    class_mask = torch.eq(labels_expanded.unsqueeze(1), labels_expanded.unsqueeze(0)).float()
     
     # Combine: positive if same sample OR same class
-    # Use maximum to combine: 1 if either condition is true
-    # torch.maximum is available in PyTorch 1.7+, fallback to torch.max for older versions
     if hasattr(torch, 'maximum'):
-        mask = torch.maximum(same_sample_mask, expanded_class_mask).float()
+        mask = torch.maximum(same_sample_mask, class_mask)
     else:
-        mask = torch.max(same_sample_mask, expanded_class_mask).float()
-
-    # Apply logits mask to exclude self-similarity
-    logits = logits * logits_mask
-    exp_logits = torch.exp(logits) * logits_mask
-
+        mask = torch.max(same_sample_mask, class_mask)
+    
+    # Exclude self-similarity (diagonal)
+    mask = mask * (1.0 - torch.eye(batch_size * n_views, device=device))
+    
     # Compute log probabilities
+    exp_logits = torch.exp(logits) * (1.0 - torch.eye(batch_size * n_views, device=device))
     log_prob = logits - torch.log(exp_logits.sum(dim=1, keepdim=True) + 1e-12)
     
-    # Compute mean log prob of positive pairs
+    # Compute mean log prob of positive pairs for each anchor
     mask_sum = mask.sum(dim=1)
     mean_log_prob_pos = (mask * log_prob).sum(dim=1) / torch.clamp(mask_sum, min=1.0)
-
-    loss = -mean_log_prob_pos
-    loss = loss.view(anchor_count, batch_size).mean()
+    
+    # Average over all anchors
+    loss = -mean_log_prob_pos.mean()
     return loss
 

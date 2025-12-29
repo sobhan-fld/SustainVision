@@ -502,6 +502,9 @@ def _execute_training_phase(
             for module in classifier.modules():
                 if hasattr(module, "reset_parameters"):
                     module.reset_parameters()  # type: ignore[attr-defined]
+        # Ensure classifier is trainable after reset
+        for param in classifier.parameters():
+            param.requires_grad = True
         print("[info] Classifier head reset for new evaluation phase.")
 
     freeze_backbone = freeze_backbone_override if freeze_backbone_override is not None else config.freeze_backbone
@@ -513,6 +516,10 @@ def _execute_training_phase(
         if hasattr(model, "projector"):
             for param in model.projector.parameters():
                 param.requires_grad = False
+        # Explicitly ensure classifier is trainable
+        if hasattr(model, "classifier"):
+            for param in model.classifier.parameters():
+                param.requires_grad = True
         print("[info] Backbone and projector frozen - only classifier head will be trained")
     elif freeze_backbone:
         print("[warn] freeze_backbone requested but model has no 'backbone' attribute")
@@ -524,6 +531,17 @@ def _execute_training_phase(
         print("[info] Training on device: unknown (model has no parameters)")
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
+    num_trainable = sum(p.numel() for p in trainable_params)
+    if hasattr(model, "classifier"):
+        classifier_params = [p for p in model.classifier.parameters() if p.requires_grad]
+        num_classifier = sum(p.numel() for p in classifier_params)
+        if num_classifier == 0:
+            print(f"[ERROR] Classifier has no trainable parameters! This will prevent learning.")
+            print(f"[ERROR] This is likely a bug - classifier should be trainable during finetune.")
+        else:
+            print(f"[info] Classifier has {num_classifier:,} trainable parameters (out of {num_trainable:,} total trainable)")
+            if freeze_backbone and num_classifier != num_trainable:
+                print(f"[warn] Expected all trainable params to be in classifier, but found {num_trainable - num_classifier:,} other trainable params")
     optimizer_name = optimizer_override if optimizer_override else config.optimizer
     weight_decay_value = (
         config.weight_decay if weight_decay_override is None else float(weight_decay_override)
@@ -539,6 +557,17 @@ def _execute_training_phase(
         lars_eps=lars_eps,
         lars_exclude_bias_n_norm=lars_exclude_bias_n_norm,
     )
+    
+    # Verify optimizer includes classifier parameters (critical for finetune)
+    if hasattr(model, "classifier") and freeze_backbone:
+        optimizer_param_ids = {id(p) for group in optimizer.param_groups for p in group["params"]}
+        classifier_param_ids = {id(p) for p in model.classifier.parameters() if p.requires_grad}
+        missing_params = classifier_param_ids - optimizer_param_ids
+        if missing_params:
+            print(f"[ERROR] Optimizer is missing {len(missing_params)} classifier parameters! This will prevent learning.")
+        else:
+            print(f"[info] Optimizer correctly includes all {len(classifier_param_ids)} classifier parameters")
+    
     scheduler_config = scheduler_config_override if scheduler_config_override is not None else config.scheduler
     scheduler_cfg_copy = copy.deepcopy(scheduler_config) if isinstance(scheduler_config, dict) else None
     scheduler_step_on_batch = False
@@ -718,6 +747,9 @@ def _execute_training_phase(
             # If backbone is frozen, keep it in eval mode (for proper BatchNorm behavior)
             if freeze_backbone and hasattr(model, "backbone"):
                 model.backbone.eval()
+            # Ensure classifier is in train mode (important after reset)
+            if hasattr(model, "classifier"):
+                model.classifier.train()
             epoch_loss = 0.0
             loss_normalizer = 0.0
             correct = 0
