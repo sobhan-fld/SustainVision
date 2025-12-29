@@ -358,6 +358,8 @@ def _execute_training_phase(
     subset_seed_override: Optional[int] = None,
     scheduler_state: Optional[dict] = None,
     cumulative_scheduler_steps: Optional[int] = None,
+    total_t_max: Optional[int] = None,
+    total_cycles: Optional[int] = None,
 ) -> Tuple[TrainingRunSummary, dict]:
     """Train a toy model using the provided configuration.
 
@@ -539,10 +541,18 @@ def _execute_training_phase(
             warmup_epochs_val = 0
         warmup_units = warmup_epochs_val * (steps_per_epoch if scheduler_step_on_batch else 1)
         
-        # If cumulative_scheduler_steps is provided, use it for t_max calculation
-        # This allows the scheduler to continue across multiple cycles
-        if cumulative_scheduler_steps is not None and t_max_strategy == "per_batch":
-            # Use cumulative steps for t_max, but still account for warmup
+        # If total_t_max is provided (from previous cycles), use it directly
+        # This ensures consistent t_max across all cycles
+        if total_t_max is not None and t_max_strategy == "per_batch":
+            scheduler_params["t_max"] = total_t_max
+        # First cycle: calculate total_t_max for ALL cycles
+        elif total_t_max is None and total_cycles is not None and total_cycles > 1 and t_max_strategy == "per_batch":
+            # Calculate total steps across all cycles
+            total_steps_all_cycles = total_units * total_cycles
+            scheduler_params["t_max"] = max(1, total_steps_all_cycles - max(0, warmup_units))
+        # If cumulative_scheduler_steps is provided but no total_t_max, calculate it
+        elif cumulative_scheduler_steps is not None and t_max_strategy == "per_batch":
+            # Calculate total steps: cumulative + remaining steps for this phase
             cumulative_total = cumulative_scheduler_steps + total_units
             scheduler_params["t_max"] = max(1, cumulative_total - max(0, warmup_units))
         elif t_max_strategy == "per_batch":
@@ -938,6 +948,11 @@ def _execute_training_phase(
     else:
         print(f"\nPhase {phase_label} complete.")
 
+    # Extract t_max from scheduler if it exists (for passing to next cycle)
+    final_total_t_max = None
+    if scheduler is not None and hasattr(scheduler, 'T_max'):
+        final_total_t_max = scheduler.T_max
+    
     return TrainingRunSummary(
         report_path=report_path,
         emissions_kg=emissions_kg_total,
@@ -949,5 +964,6 @@ def _execute_training_phase(
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+        "total_t_max": final_total_t_max,
     }
 

@@ -82,6 +82,8 @@ def _run_pretrain_phase(
     report_path: Path,
     scheduler_state: Optional[dict] = None,
     cumulative_scheduler_steps: Optional[int] = None,
+    total_t_max: Optional[int] = None,
+    total_cycles: Optional[int] = None,
 ) -> Tuple[TrainingRunSummary, dict]:
     """Run a single pretrain phase (contrastive learning).
     
@@ -112,6 +114,8 @@ def _run_pretrain_phase(
         simclr_recipe_override=params["use_reference_transforms"],
         scheduler_state=scheduler_state,
         cumulative_scheduler_steps=cumulative_scheduler_steps,
+        total_t_max=total_t_max,  # Pass through total_t_max for consistent scheduling
+        total_cycles=total_cycles,  # Pass total_cycles to calculate total_t_max in first cycle
     )
     return summary, state
 
@@ -201,7 +205,8 @@ def _run_single_cycle(
     report_path: Path,
     scheduler_state: Optional[dict] = None,
     cumulative_scheduler_steps: Optional[int] = None,
-) -> Tuple[dict, Optional[int], Optional[dict]]:
+    total_t_max: Optional[int] = None,
+) -> Tuple[dict, Optional[int], Optional[dict], Optional[int]]:
     """Run one complete cycle: pretrain + finetune.
     
     Returns:
@@ -213,13 +218,18 @@ def _run_single_cycle(
     print(f"{'='*60}\n")
     
     # Run pretrain phase (scheduler continues across pretrain cycles)
+    # Pass total_t_max and total_cycles to ensure consistent scheduler behavior
     pretrain_summary, pretrain_state = _run_pretrain_phase(
         config, cycle, params, model_state, project_dir, report_path,
         scheduler_state=scheduler_state,
         cumulative_scheduler_steps=cumulative_scheduler_steps,
+        total_t_max=total_t_max,
+        total_cycles=total_cycles,
     )
     model_state = pretrain_state.get("model_state")
     scheduler_state = pretrain_state.get("scheduler_state")
+    # Update total_t_max from pretrain state (calculated in first cycle)
+    total_t_max = pretrain_state.get("total_t_max", total_t_max)
     
     # Update cumulative steps from scheduler state
     # The scheduler state contains 'last_epoch' which is the total steps taken
@@ -279,7 +289,7 @@ def _run_single_cycle(
         append=False,
     )
     
-    return model_state, cumulative_scheduler_steps, scheduler_state, cycle_emissions_kg, cycle_energy_kwh
+    return model_state, cumulative_scheduler_steps, scheduler_state, total_t_max, cycle_emissions_kg, cycle_energy_kwh
 
 
 def run_contrastive_schedule(
@@ -314,13 +324,14 @@ def run_contrastive_schedule(
     model_state: Optional[dict] = None
     scheduler_state: Optional[dict] = None
     cumulative_scheduler_steps: Optional[int] = None
+    total_t_max: Optional[int] = None
     total_emissions_kg: Optional[float] = None
     total_energy_kwh: Optional[float] = None
     start_time = time.perf_counter()
     
     # Run all cycles
     for cycle in range(1, params["cycles"] + 1):
-        model_state, cumulative_scheduler_steps, scheduler_state, cycle_emissions_kg, cycle_energy_kwh = _run_single_cycle(
+        model_state, cumulative_scheduler_steps, scheduler_state, total_t_max, cycle_emissions_kg, cycle_energy_kwh = _run_single_cycle(
             config,
             cycle,
             params["cycles"],
@@ -331,6 +342,7 @@ def run_contrastive_schedule(
             report_path,
             scheduler_state=scheduler_state,
             cumulative_scheduler_steps=cumulative_scheduler_steps,
+            total_t_max=total_t_max,
         )
         if cycle_emissions_kg is not None:
             total_emissions_kg = (total_emissions_kg or 0.0) + float(cycle_emissions_kg)
