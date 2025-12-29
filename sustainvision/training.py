@@ -497,7 +497,11 @@ def _execute_training_phase(
         model.backbone.eval()
         for param in model.backbone.parameters():
             param.requires_grad = False
-        print("[info] Backbone frozen - only classifier head will be trained")
+        # Also freeze projector head during linear evaluation (it's only for contrastive learning)
+        if hasattr(model, "projector"):
+            for param in model.projector.parameters():
+                param.requires_grad = False
+        print("[info] Backbone and projector frozen - only classifier head will be trained")
     elif freeze_backbone:
         print("[warn] freeze_backbone requested but model has no 'backbone' attribute")
 
