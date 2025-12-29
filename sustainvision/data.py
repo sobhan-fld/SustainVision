@@ -182,6 +182,8 @@ def build_classification_dataloaders(
     simclr_recipe: bool = False,
     subset_per_class: Optional[int] = None,
     subset_seed: Optional[int] = None,
+    use_m_per_class_sampler: bool = False,
+    m_per_class: Optional[int] = None,
 ) -> Tuple["DataLoader", "DataLoader", int]:  # type: ignore[name-defined]
     """Create train/val dataloaders for common classification datasets."""
 
@@ -506,10 +508,60 @@ def build_classification_dataloaders(
     if not contrastive and subset_value:
         train_dataset = _maybe_subset(train_dataset, subset_value, subset_seed, num_classes)
 
+    # Setup sampler for M-per-class sampling (useful for SupCon)
+    train_sampler = None
+    shuffle = True
+    
+    if use_m_per_class_sampler and m_per_class is not None and contrastive:
+        try:
+            from sustainvision.samplers import MPerClassSampler
+            
+            # Get labels from dataset
+            labels = None
+            if hasattr(train_dataset, 'targets'):
+                labels = train_dataset.targets
+            elif hasattr(train_dataset, 'base_ds') and hasattr(train_dataset.base_ds, 'targets'):
+                labels = train_dataset.base_ds.targets
+            else:
+                # Try to extract from dataset (for wrapped contrastive datasets)
+                if hasattr(train_dataset, 'base_ds'):
+                    base_ds = train_dataset.base_ds
+                    if hasattr(base_ds, 'targets'):
+                        labels = base_ds.targets
+                    elif hasattr(base_ds, 'dataset') and hasattr(base_ds.dataset, 'targets'):
+                        labels = base_ds.dataset.targets
+            
+            if labels is None:
+                # Fallback: extract labels by iterating (slow but works)
+                print("[warn] Could not find labels attribute, extracting from dataset (this may be slow)...")
+                labels = [train_dataset[i][1] if isinstance(train_dataset[i], tuple) else train_dataset[i]['target'] 
+                          for i in range(min(len(train_dataset), 1000))]  # Sample first 1000 to get labels
+                # If we have a wrapped dataset, try to get full labels
+                if hasattr(train_dataset, 'base_ds'):
+                    try:
+                        labels = [train_dataset.base_ds[i][1] for i in range(len(train_dataset.base_ds))]
+                    except:
+                        pass
+            
+            if labels is not None:
+                train_sampler = MPerClassSampler(
+                    labels=labels,
+                    m_per_class=m_per_class,
+                    batch_size=batch_size,
+                    seed=seed
+                )
+                shuffle = False  # Must be False when using custom sampler
+                print(f"[info] Using MPerClassSampler: {m_per_class} samples per class, {batch_size // m_per_class} classes per batch")
+            else:
+                print("[warn] Could not extract labels for MPerClassSampler, falling back to random sampling")
+        except Exception as e:
+            print(f"[warn] Failed to create MPerClassSampler: {e}. Falling back to random sampling.")
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        sampler=train_sampler,
+        shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=contrastive,

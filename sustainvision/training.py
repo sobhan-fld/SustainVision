@@ -434,6 +434,16 @@ def _execute_training_phase(
     classification_mode = not contrastive_mode
 
     data_root = Path.cwd()
+    
+    # Check if we should use M-per-class sampler for SupCon
+    use_m_per_class_sampler = False
+    m_per_class = None
+    if contrastive_mode and loss_spec.mode == "supcon":
+        m_per_class = config.hyperparameters.get("m_per_class")
+        use_m_per_class_sampler = config.hyperparameters.get("use_m_per_class_sampler", False)
+        if m_per_class is not None and m_per_class > 0:
+            use_m_per_class_sampler = True
+    
     try:
         train_loader, val_loader, num_classes = build_classification_dataloaders(
             config.database,
@@ -448,6 +458,8 @@ def _execute_training_phase(
             simclr_recipe=simclr_recipe,
             subset_per_class=subset_per_class if (subset_per_class and classification_mode) else None,
             subset_seed=subset_seed,
+            use_m_per_class_sampler=use_m_per_class_sampler,
+            m_per_class=m_per_class,
         )
     except DatasetPreparationError as exc:
         raise MissingDependencyError(str(exc)) from exc
