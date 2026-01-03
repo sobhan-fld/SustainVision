@@ -50,6 +50,42 @@ def _adapt_mobilenet_for_small_images(backbone: "nn.Module", image_size: int) ->
             conv.stride = (1, 1)
 
 
+def _adapt_efficientnet_for_small_images(backbone: "nn.Module", image_size: int) -> None:  # type: ignore[name-defined]
+    """Reduce initial downsampling so 32x32 inputs don't collapse to 1x1.
+    
+    EfficientNet-B0 structure:
+    - features[0]: Initial Conv2d (stride=2 by default)
+    - features[1]: First MBConv block
+    - features[2]: Second MBConv block (may have stride=2)
+    """
+    if image_size > 64 or not hasattr(backbone, "features"):
+        return
+
+    features = backbone.features  # type: ignore[attr-defined]
+    
+    # Adjust initial stem convolution (stride 2 -> 1)
+    if len(features) > 0:
+        stem_conv = _safe_get_submodule(features, (0,))
+        if isinstance(stem_conv, nn.Conv2d) and stem_conv.stride[0] > 1:
+            stem_conv.stride = (1, 1)
+            # Adjust padding to maintain output size
+            if stem_conv.padding[0] == 0:
+                stem_conv.padding = (1, 1)
+    
+    # Adjust first MBConv block if it has stride > 1
+    if len(features) > 1:
+        first_block = _safe_get_submodule(features, (1,))
+        if first_block is not None:
+            # MBConv blocks have a depthwise conv that may have stride=2
+            # Try to find and adjust it
+            for name, module in first_block.named_modules():
+                if isinstance(module, nn.Conv2d) and hasattr(module, 'stride') and module.stride[0] > 1:
+                    # Check if it's a depthwise conv (groups == in_channels)
+                    if hasattr(module, 'groups') and module.groups > 1:
+                        module.stride = (1, 1)
+                        break
+
+
 class ProjectionModel(nn.Module):  # type: ignore[name-defined]
     """Wrap a backbone with classification and projection heads."""
 
@@ -219,6 +255,7 @@ def build_model(
             )
         if key == "efficientnet_b0":
             backbone = tv_models.efficientnet_b0(weights=None)
+            _adapt_efficientnet_for_small_images(backbone, image_size)
             feature_dim = backbone.classifier[-1].in_features
             backbone.classifier[-1] = nn.Identity()
             return ProjectionModel(

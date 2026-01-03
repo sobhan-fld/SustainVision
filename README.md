@@ -156,11 +156,16 @@ simclr_schedule:
   cycles: 8
   pretrain_epochs: 50
   finetune_epochs: 20
-  pretrain_loss: simclr
+  pretrain_loss: supcon  # or simclr
   finetune_loss: cross_entropy
   finetune_lr: 0.01  # Optional: different LR for finetune
   freeze_backbone: true  # Linear evaluation
   optimizer_reset: true  # Reset optimizer between phases
+
+hyperparameters:
+  batch_size: 256
+  use_m_per_class_sampler: true  # Recommended for SupCon
+  m_per_class: 8  # 32 classes * 8 samples = 256 batch size
 ```
 
 This gives you 8 cycles × (50 + 20) = 560 total epochs with automatic phase switching.
@@ -220,6 +225,10 @@ Configuration Reference
   - `val_split`
   - `image_size`
   - `projection_dim`
+  - `projection_hidden_dim` (optional, for multi-layer projection head)
+  - `projection_use_bn` (optional, enable batch normalization in projection head)
+  - `use_m_per_class_sampler` (optional, for SupCon: ensures balanced batches with positive pairs)
+  - `m_per_class` (optional, number of samples per class per batch when using MPerClassSampler)
 
 Available Options Cheat Sheet
 -----------------------------
@@ -252,7 +261,7 @@ Available Options Cheat Sheet
 - `cpu`, `cuda`, or `cuda:{index}`. On Colab/GPUs, set `device="cuda"` so the trainer stays on GPU.
 
 **Dataset Helpers**
-- `cifar10`, `mnist`, `synthetic`
+- `cifar10`, `cifar100`, `mnist`, `synthetic`
 - Any ImageFolder layout (`train/`, `val/`, `test/` directories)
 
 **Early Stopping**
@@ -267,6 +276,12 @@ Available Options Cheat Sheet
 - Set separate learning rate for finetune phase
 - Choose to freeze backbone during finetune (linear evaluation)
 - Checkpoints saved after each finetune phase with cycle suffix
+
+**MPerClassSampler for SupCon**
+- When using SupCon loss, enable `use_m_per_class_sampler: true` to ensure each batch contains balanced samples from multiple classes
+- This guarantees positive pairs exist in every batch, which is crucial for effective SupCon learning
+- Set `m_per_class` to the number of samples per class per batch (e.g., `m_per_class: 8` with `batch_size: 256` gives 32 classes per batch)
+- Automatically disabled for non-contrastive losses
 
 **TUI Prompts**
 - Every prompt mirrors the config keys above; defaults are safe for CPU smoke tests (batch 32, 1 epoch, mobilenet, etc.).
@@ -293,6 +308,7 @@ The codebase is organized into focused modules for maintainability:
 - **`schedule.py`**: Contrastive learning alternating schedule implementation
 - **`utils.py`**: Utility functions (device resolution, seeding, paths)
 - **`losses.py`**: Loss function implementations (SimCLR, SupCon, standard losses)
+- **`samplers.py`**: Custom data samplers (MPerClassSampler for balanced contrastive learning batches)
 - **`optimizers.py`**: Optimizer and scheduler builders
 - **`models.py`**: Model building utilities (torchvision backbones, projection heads)
 - **`reporting.py`**: CSV reporting and metrics logging
@@ -321,19 +337,35 @@ Contributing & Feedback
 We welcome issues, feature requests, and success stories. Tell us how you are using SustainVision, where the workflows feel clunky, or what sustainability metrics you would love to track next. If you plan to open a pull request, please follow common Python conventions (linting, type hints where practical, and clear docstrings that explain why a change exists).
 
 
-example Command for running from config
--------
-cd /home/sfooladi/github/SustainVision
-PYTHONPATH=$(pwd) ~/.virtualenvs/SustainVision/bin/python scripts/run_with_config.py \
-  --config configs/cifar10_resnet18_ce.yaml \
-  --project-root outputs \
-  | tee logs/ce_cifar10_$(date +%Y%m%d_%H%M%S).log
+Example Commands for Running from Config
+-----------------------------------------
 
+**CIFAR100 with ResNet18 and SupCon:**
+```bash
 cd /home/sfooladi/github/SustainVision
 PYTHONPATH=$(pwd) ~/.virtualenvs/SustainVision/bin/python scripts/run_with_config.py \
-  --config configs/cifar10_mobilenet_large_supcon.yaml \
+  --config configs/cifar100_resnet18_supcon_full_v3.yaml \
   --project-root outputs \
-  | tee logs/supcon_mbv3large_$(date +%Y%m%d_%H%M%S).log
+  | tee logs/supcon_resnet18_cifar100_$(date +%Y%m%d_%H%M%S).log
+```
+
+**CIFAR100 with MobileNet V3 Large and SupCon:**
+```bash
+cd /home/sfooladi/github/SustainVision
+PYTHONPATH=$(pwd) ~/.virtualenvs/SustainVision/bin/python scripts/run_with_config.py \
+  --config configs/cifar100_mobilenet_large_supcon_full_v3.yaml \
+  --project-root outputs \
+  | tee logs/supcon_mbv3large_cifar100_$(date +%Y%m%d_%H%M%S).log
+```
+
+**CIFAR100 with EfficientNet-B0 and SupCon:**
+```bash
+cd /home/sfooladi/github/SustainVision
+PYTHONPATH=$(pwd) ~/.virtualenvs/SustainVision/bin/python scripts/run_with_config.py \
+  --config configs/efficientnet_b0_supcon_full_v3.yaml \
+  --project-root outputs \
+  | tee logs/supcon_efficientnet_cifar100_$(date +%Y%m%d_%H%M%S).log
+```
 
 License
 -------
