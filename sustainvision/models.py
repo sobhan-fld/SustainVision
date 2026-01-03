@@ -55,8 +55,10 @@ def _adapt_efficientnet_for_small_images(backbone: "nn.Module", image_size: int)
     
     EfficientNet-B0 structure:
     - features[0]: Initial Conv2d (stride=2 by default)
-    - features[1]: First MBConv block
+    - features[1]: First MBConv block (may have stride=2)
     - features[2]: Second MBConv block (may have stride=2)
+    
+    For 32x32 images, we reduce stride in the initial layers to preserve spatial resolution.
     """
     if image_size > 64 or not hasattr(backbone, "features"):
         return
@@ -66,24 +68,28 @@ def _adapt_efficientnet_for_small_images(backbone: "nn.Module", image_size: int)
     # Adjust initial stem convolution (stride 2 -> 1)
     if len(features) > 0:
         stem_conv = _safe_get_submodule(features, (0,))
-        if isinstance(stem_conv, nn.Conv2d) and stem_conv.stride[0] > 1:
-            stem_conv.stride = (1, 1)
-            # Adjust padding to maintain output size
-            if stem_conv.padding[0] == 0:
-                stem_conv.padding = (1, 1)
+        if isinstance(stem_conv, nn.Conv2d):
+            if stem_conv.stride[0] > 1:
+                stem_conv.stride = (1, 1)
+                # Adjust padding to maintain output size (kernel_size=3 needs padding=1)
+                if stem_conv.kernel_size[0] == 3 and stem_conv.padding[0] == 0:
+                    stem_conv.padding = (1, 1)
     
-    # Adjust first MBConv block if it has stride > 1
-    if len(features) > 1:
-        first_block = _safe_get_submodule(features, (1,))
-        if first_block is not None:
-            # MBConv blocks have a depthwise conv that may have stride=2
-            # Try to find and adjust it
-            for name, module in first_block.named_modules():
-                if isinstance(module, nn.Conv2d) and hasattr(module, 'stride') and module.stride[0] > 1:
-                    # Check if it's a depthwise conv (groups == in_channels)
-                    if hasattr(module, 'groups') and module.groups > 1:
+    # Adjust first few MBConv blocks to reduce downsampling
+    # Typically the first 1-2 blocks have stride=2
+    for block_idx in [1, 2]:
+        if len(features) > block_idx:
+            block = _safe_get_submodule(features, (block_idx,))
+            if block is not None:
+                # MBConv blocks contain depthwise convolutions with stride
+                # Look for Conv2d layers with stride > 1 in the block
+                for module in block.modules():
+                    if isinstance(module, nn.Conv2d) and module.stride[0] > 1:
+                        # Reduce stride to 1 for small images
                         module.stride = (1, 1)
-                        break
+                        # Adjust padding if needed (for kernel_size=3 or 5)
+                        if module.kernel_size[0] in [3, 5] and module.padding[0] == 0:
+                            module.padding = (module.kernel_size[0] // 2, module.kernel_size[0] // 2)
 
 
 class ProjectionModel(nn.Module):  # type: ignore[name-defined]
