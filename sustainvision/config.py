@@ -126,6 +126,15 @@ class TrainingConfig:
         }
     )
     report_filename: str = "training_report.csv"
+    evaluation: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "checkpoint_path": None,
+            "head_type": "classification",  # "classification" or "detection"
+            "num_anchors": 9,  # For detection head
+            "hidden_dim": 256,  # For detection head
+        }
+    )
     hyperparameters: Dict[str, Any] = field(
         default_factory=lambda: {
             "batch_size": 32,
@@ -210,6 +219,11 @@ class ConfigManager:
             default_quant = default_dict.get("quantization", {}) or {}
             incoming_quant = merged.get("quantization") or {}
             merged["quantization"] = {**default_quant, **incoming_quant}
+
+            # Merge evaluation settings
+            default_eval = default_dict.get("evaluation", {}) or {}
+            incoming_eval = merged.get("evaluation") or {}
+            merged["evaluation"] = {**default_eval, **incoming_eval}
 
             self._config = TrainingConfig(**merged)
         return self._config

@@ -13,3 +13,7 @@ training_report.csv
 logs/
 configs/
 configs_laptop/
+configs_laptop_v3/
+configs_v3/
+outputs_v3/
+outputs_old2/

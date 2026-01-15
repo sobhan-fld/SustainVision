@@ -1,0 +1,70 @@
+model: resnet18
+database: databases/cifar100
+device: cuda
+seed: 42
+optimizer: sgd
+loss_function: supcon
+weight_decay: 0.0001
+
+scheduler:
+  type: cosine_annealing
+  params:
+    eta_min: 0.0
+    t_max_strategy: per_batch
+    warmup_epochs: 10
+  step_on_batch: true
+
+gradient_clip_norm: 1.0
+mixed_precision: true
+save_model: true
+save_model_path: outputs/resnet18_supcon_mperclass_cifar100_laptop_v4
+checkpoint_path: null
+freeze_backbone: false
+
+early_stopping:
+  enabled: false
+  patience: 3
+  metric: val_loss
+  mode: min
+
+simclr_schedule:
+  enabled: true
+  # Multi-cycle: pretrain → evaluate (frozen backbone) → continue pretrain → evaluate...
+  # Each cycle evaluates backbone quality with fresh linear head to track improvement
+  # V4: Laptop-optimized config with reduced batch size
+  cycles: 10
+  pretrain_epochs: 100
+  finetune_epochs: 40
+  pretrain_loss: supcon
+  finetune_loss: cross_entropy
+  finetune_lr: 0.1
+  finetune_optimizer: sgd
+  finetune_weight_decay: 0.0001
+  freeze_backbone: true
+  optimizer_reset: true
+  use_reference_transforms: true
+  linear_subset_per_class: null
+  linear_subset_seed: 42
+
+report_filename: resnet18_supcon_mperclass_cifar100_laptop_v4/resnet18_supcon_mperclass_cifar100_laptop_v4.csv
+
+hyperparameters:
+  batch_size: 200  # Laptop-optimized: 100 classes * 2 samples per class
+  lr: 0.5
+  epochs: 300  # NOTE: Ignored when simclr_schedule.enabled=true (uses pretrain_epochs per cycle instead)
+  momentum: 0.9
+  temperature: 0.25
+  num_workers: 4  # Reduced for laptop
+  val_split: 0.0
+  image_size: 32
+  projection_dim: 128
+  projection_hidden_dim: 2048
+  projection_use_bn: true
+  use_gaussian_blur: true
+  simclr_reference_transforms: true
+  linear_subset_per_class: null
+  linear_subset_seed: 42
+  # M-per-class sampler for SupCon: ensures each batch has multiple samples per class
+  # This guarantees positive pairs exist in every batch, crucial for SupCon learning
+  use_m_per_class_sampler: true
+  m_per_class: 2  # 100 classes * 2 samples = 200 batch size

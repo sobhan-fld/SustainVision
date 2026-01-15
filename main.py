@@ -13,6 +13,7 @@ from sustainvision.data import prompt_and_download
 from sustainvision.tui import run_config_tui
 from sustainvision.training import MissingDependencyError, train_model
 from sustainvision.types import TrainingRunSummary
+from sustainvision.evaluation import evaluate_with_head
 
 
 def _start_training(cm: ConfigManager) -> None:
@@ -39,6 +40,55 @@ def _start_training(cm: ConfigManager) -> None:
         print(f"- duration (s): {summary.duration_seconds:.2f}")
     if summary.quantized_model_path is not None:
         print(f"- quantized model: {summary.quantized_model_path}")
+
+
+def _start_evaluation(cm: ConfigManager) -> None:
+    """Evaluate a pretrained backbone with different heads."""
+
+    config = cm.load()
+    eval_cfg = config.evaluation or {}
+    
+    if not eval_cfg.get("enabled", False):
+        print("\n[error] Evaluation mode is not enabled in config.")
+        print("Set evaluation.enabled: true in your config file.\n")
+        return
+    
+    checkpoint_path = eval_cfg.get("checkpoint_path")
+    if not checkpoint_path:
+        checkpoint_path = config.checkpoint_path
+    
+    if not checkpoint_path:
+        print("\n[error] No checkpoint path specified.")
+        print("Set evaluation.checkpoint_path or checkpoint_path in your config file.\n")
+        return
+    
+    head_type = eval_cfg.get("head_type", "classification")
+    
+    print(f"\n[info] Starting evaluation with {head_type} head")
+    print(f"[info] Checkpoint: {checkpoint_path}")
+    print(f"[info] Model: {config.model}")
+    print(f"[info] Dataset: {config.database}\n")
+    
+    output_root = Path.cwd() / "outputs"
+    
+    try:
+        results = evaluate_with_head(
+            config,
+            checkpoint_path,
+            head_type=head_type,
+            project_root=output_root,
+            num_anchors=eval_cfg.get("num_anchors", 9),
+            hidden_dim=eval_cfg.get("hidden_dim", 256),
+        )
+        
+        print("\nEvaluation results:")
+        for key, value in results.items():
+            print(f"- {key}: {value}")
+        
+    except Exception as exc:  # pragma: no cover - runtime protection
+        print(f"\n[error] Evaluation failed: {exc}\n")
+        import traceback
+        traceback.print_exc()
 
 
 def _choose_and_run_config(configs_dir: Path) -> None:
@@ -146,6 +196,7 @@ def main() -> None:
             "Select an action:",
             choices=[
                 "Start training",
+                "Evaluate pretrained model",
                 "Run config from configs/",
                 "Configure settings",
                 "Download databases",
@@ -161,6 +212,8 @@ def main() -> None:
             cm.load()  # refresh in-memory config after edits
         elif choice == "Start training":
             _start_training(cm)
+        elif choice == "Evaluate pretrained model":
+            _start_evaluation(cm)
         elif choice == "Run config from configs/":
             _choose_and_run_config(Path("configs"))
         elif choice == "Download databases":

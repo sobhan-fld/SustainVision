@@ -89,6 +89,62 @@ def download_dataset(dataset: str, *, project_root: Optional[Path] = None) -> Pa
         torchvision_datasets.MNIST(root=str(target), download=True)
         return target
 
+    if name == "coco":
+        target = root / "coco"
+        _prepare_root(target)
+        # COCO dataset requires manual download - torchvision doesn't support auto-download
+        print("[info] COCO dataset requires manual download.")
+        print("[info] Download from: https://cocodataset.org/#download")
+        print("[info] Required files:")
+        print("  - train2017.zip (~18GB) -> extract to databases/coco/images/train2017/")
+        print("  - val2017.zip (~1GB) -> extract to databases/coco/images/val2017/")
+        print("  - annotations_trainval2017.zip -> extract to databases/coco/annotations/")
+        print("[info] Expected structure:")
+        print("  databases/coco/")
+        print("    images/")
+        print("      train2017/")
+        print("      val2017/")
+        print("    annotations/")
+        print("      instances_train2017.json")
+        print("      instances_val2017.json")
+        print(f"[info] Directory created at: {target}")
+        print("[info] After downloading, you can use the dataset for evaluation.")
+        return target
+
+    if name == "voc" or name == "pascal_voc":
+        target = root / "voc"
+        _prepare_root(target)
+        try:
+            # Download Pascal VOC 2012
+            # Note: torchvision's automatic download may fail due to firewall/network issues
+            print("[info] Attempting to download Pascal VOC 2012...")
+            print("[info] This may take 10-30 minutes (~2GB download)...")
+            print("[warn] If download fails due to firewall, try:")
+            print("  - Using a VPN or different network")
+            print("  - Downloading from a personal device and transferring")
+            print("  - Contacting network admin about firewall policy 10263")
+            dataset = torchvision_datasets.VOCDetection(
+                root=str(target),
+                year="2012",
+                image_set="train",
+                download=True,
+            )
+            # Verify download by checking if dataset can be loaded
+            if len(dataset) == 0:
+                raise ValueError("Downloaded dataset appears empty")
+            print(f"[info] Pascal VOC 2012 downloaded successfully! ({len(dataset)} images)")
+        except Exception as exc:
+            print(f"[warn] Automatic Pascal VOC download failed: {exc}")
+            print("[info] The download may be blocked by a firewall (policy 10263).")
+            print("[info] Alternative options:")
+            print("  1. Use a VPN or different network connection")
+            print("  2. Download from: http://host.robots.ox.ac.uk/pascal/VOC/voc2012/")
+            print("     (on a device not behind the firewall)")
+            print(f"  3. Extract to: {target}")
+            print("  4. Expected structure: databases/voc/VOCdevkit/VOC2012/")
+            print("[info] For now, you can test evaluation with classification on CIFAR-10/100")
+        return target
+
     raise DatasetDownloadError(f"Unsupported dataset option: {dataset}")
 
 
@@ -97,7 +153,15 @@ def prompt_and_download(project_root: Optional[Path] = None) -> Optional[Path]:
 
     choice = questionary.select(
         "Select a dataset to download:",
-        choices=["CIFAR10", "CIFAR100", "MNIST", "Synthetic placeholder", "Cancel"],
+        choices=[
+            "CIFAR10",
+            "CIFAR100",
+            "MNIST",
+            "COCO (Object Detection)",
+            "Pascal VOC (Object Detection)",
+            "Synthetic placeholder",
+            "Cancel",
+        ],
         default="CIFAR10",
     ).ask()
 
@@ -108,6 +172,8 @@ def prompt_and_download(project_root: Optional[Path] = None) -> Optional[Path]:
         "CIFAR10": "cifar10",
         "CIFAR100": "cifar100",
         "MNIST": "mnist",
+        "COCO (Object Detection)": "coco",
+        "Pascal VOC (Object Detection)": "voc",
         "Synthetic placeholder": "synthetic",
     }
 
@@ -142,6 +208,9 @@ def _resolve_dataset_source(database: str, root: Path) -> Tuple[str, Path]:
         "cifar10": root / "databases" / "cifar10",
         "cifar100": root / "databases" / "cifar100",
         "mnist": root / "databases" / "mnist",
+        "coco": root / "databases" / "coco",
+        "voc": root / "databases" / "voc",
+        "pascal_voc": root / "databases" / "voc",
     }
 
     if lower in known_roots:
@@ -158,6 +227,12 @@ def _resolve_dataset_source(database: str, root: Path) -> Tuple[str, Path]:
             return "cifar100", candidate
         if (candidate / "MNIST").exists() or any(p.name.startswith("t10k") for p in candidate.glob("*")):
             return "mnist", candidate
+        if (candidate / "images").exists() and (candidate / "annotations").exists():
+            # COCO format
+            return "coco", candidate
+        if (candidate / "VOCdevkit").exists() or (candidate / "VOC2012").exists():
+            # Pascal VOC format
+            return "voc", candidate
         return "imagefolder", candidate
 
     if lower in {"cifar10", "cifar100", "mnist"}:
@@ -575,5 +650,270 @@ def build_classification_dataloaders(
     )
 
     return train_loader, val_loader, num_classes
+
+
+def build_detection_dataloaders(
+    database: str,
+    *,
+    batch_size: int,
+    num_workers: int,
+    val_split: float = 0.0,
+    seed: int = 42,
+    project_root: Optional[Path] = None,
+    image_size: int = 224,
+) -> Tuple["DataLoader", "DataLoader", int]:  # type: ignore[name-defined]
+    """Build dataloaders for object detection datasets (COCO, Pascal VOC).
+    
+    Returns dataloaders that yield (image, target) where target contains:
+    - 'boxes': [N, 4] tensor of bounding boxes in (x1, y1, x2, y2) format
+    - 'labels': [N] tensor of class labels
+    - 'image_id': image identifier
+    
+    Parameters
+    ----------
+    database:
+        Dataset name ("coco", "voc") or path to detection dataset
+    batch_size:
+        Batch size for dataloaders
+    num_workers:
+        Number of worker processes for data loading
+    val_split:
+        Validation split ratio (0.0 means use separate val set if available)
+    seed:
+        Random seed
+    project_root:
+        Project root directory
+    image_size:
+        Target image size for resizing
+        
+    Returns
+    -------
+    Tuple of (train_loader, val_loader, num_classes)
+    """
+    try:
+        import torch
+        from torch.utils.data import DataLoader
+    except Exception as exc:
+        raise DatasetPreparationError(
+            "PyTorch is required for building dataloaders. Install it to proceed."
+        ) from exc
+
+    _ = _require_torchvision()
+    from torchvision import datasets as tv_datasets, transforms
+
+    root = Path(project_root or Path.cwd())
+    database_lower = database.lower().strip()
+
+    # Normalize image size
+    image_size = max(32, int(image_size))
+    num_workers = max(0, int(num_workers))
+
+    # Define transforms
+    transform = transforms.Compose([
+        transforms.Resize((image_size, image_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    # Load COCO dataset
+    if database_lower == "coco":
+        coco_root = root / "databases" / "coco"
+        if not coco_root.exists():
+            # Try to resolve as path
+            candidate = Path(database)
+            if not candidate.is_absolute():
+                candidate = (root / database).resolve()
+            if candidate.exists():
+                coco_root = candidate
+            else:
+                raise DatasetPreparationError(
+                    f"COCO dataset not found at {coco_root}. "
+                    "Please download it first using 'Download databases' menu."
+                )
+
+        train_images = coco_root / "images" / "train2017"
+        train_ann = coco_root / "annotations" / "instances_train2017.json"
+        val_images = coco_root / "images" / "val2017"
+        val_ann = coco_root / "annotations" / "instances_val2017.json"
+
+        if not train_images.exists() or not train_ann.exists():
+            raise DatasetPreparationError(
+                f"COCO train set not found. Expected:\n"
+                f"  {train_images}\n"
+                f"  {train_ann}"
+            )
+
+        train_dataset = tv_datasets.CocoDetection(
+            root=str(train_images),
+            annFile=str(train_ann),
+            transform=transform,
+        )
+
+        if val_images.exists() and val_ann.exists():
+            val_dataset = tv_datasets.CocoDetection(
+                root=str(val_images),
+                annFile=str(val_ann),
+                transform=transform,
+            )
+        else:
+            print("[warn] COCO validation set not found, using train set split")
+            from torch.utils.data import Subset
+            total = len(train_dataset)
+            val_count = max(1, int(total * 0.1))  # 10% for validation
+            indices = torch.randperm(total, generator=torch.Generator().manual_seed(seed))
+            val_dataset = Subset(train_dataset, indices[:val_count].tolist())
+            train_dataset = Subset(train_dataset, indices[val_count:].tolist())
+
+        # COCO has 80 classes (1-90, but some IDs are skipped)
+        num_classes = 80
+
+    # Load Pascal VOC dataset
+    elif database_lower in {"voc", "pascal_voc"}:
+        voc_root = root / "databases" / "voc"
+        if not voc_root.exists():
+            candidate = Path(database)
+            if not candidate.is_absolute():
+                candidate = (root / database).resolve()
+            if candidate.exists():
+                voc_root = candidate
+            else:
+                raise DatasetPreparationError(
+                    f"Pascal VOC dataset not found at {voc_root}. "
+                    "Please download it first using 'Download databases' menu."
+                )
+
+        train_dataset = tv_datasets.VOCDetection(
+            root=str(voc_root),
+            year="2012",
+            image_set="train",
+            transform=transform,
+            download=False,
+        )
+
+        try:
+            val_dataset = tv_datasets.VOCDetection(
+                root=str(voc_root),
+                year="2012",
+                image_set="val",
+                transform=transform,
+                download=False,
+            )
+        except Exception:
+            print("[warn] Pascal VOC validation set not found, using train set split")
+            from torch.utils.data import Subset
+            total = len(train_dataset)
+            val_count = max(1, int(total * 0.1))
+            indices = torch.randperm(total, generator=torch.Generator().manual_seed(seed))
+            val_dataset = Subset(train_dataset, indices[:val_count].tolist())
+            train_dataset = Subset(train_dataset, indices[val_count:].tolist())
+
+        # Pascal VOC has 20 classes
+        num_classes = 20
+
+    else:
+        raise DatasetPreparationError(
+            f"Unsupported detection dataset: {database}. "
+            "Supported: 'coco', 'voc', 'pascal_voc'"
+        )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=_collate_detection_batch,  # Custom collate for detection
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=_collate_detection_batch,
+    )
+
+    return train_loader, val_loader, num_classes
+
+
+def _collate_detection_batch(batch: list) -> Tuple["torch.Tensor", list]:  # type: ignore[name-defined]
+    """Custom collate function for detection datasets.
+    
+    Handles variable number of objects per image by returning targets as a list.
+    Torchvision COCO/VOC datasets return targets as dicts with 'annotations' key.
+    """
+    try:
+        import torch
+    except Exception:
+        raise DatasetPreparationError("PyTorch is required")
+
+    images = []
+    targets = []
+
+    for image, target in batch:
+        images.append(image)
+        
+        # Torchvision COCO/VOC datasets return target as dict
+        if isinstance(target, dict):
+            boxes = []
+            labels = []
+            
+            # COCO format: target is a dict with list of annotation dicts
+            annotations = target.get("annotations", [])
+            if annotations:
+                for ann in annotations:
+                    if "bbox" in ann:
+                        # COCO bbox format: [x, y, width, height] -> [x1, y1, x2, y2]
+                        bbox = ann["bbox"]
+                        x, y, w, h = bbox
+                        boxes.append([x, y, x + w, y + h])
+                        # COCO category_id is 1-indexed, convert to 0-indexed
+                        cat_id = ann.get("category_id", 0)
+                        labels.append(max(0, cat_id - 1))  # Convert to 0-indexed
+                    elif "segmentation" in ann:
+                        # Some COCO annotations might have segmentation but not bbox
+                        continue
+            
+            # Pascal VOC format: target is dict with 'annotation' key containing 'object' list
+            if not boxes and "annotation" in target:
+                annotation = target["annotation"]
+                objects = annotation.get("object", [])
+                if isinstance(objects, list):
+                    for obj in objects:
+                        if "bndbox" in obj:
+                            bbox = obj["bndbox"]
+                            x1 = float(bbox.get("xmin", 0))
+                            y1 = float(bbox.get("ymin", 0))
+                            x2 = float(bbox.get("xmax", 0))
+                            y2 = float(bbox.get("ymax", 0))
+                            boxes.append([x1, y1, x2, y2])
+                            # Pascal VOC class names need to be converted to IDs
+                            # For now, use a simple hash or index
+                            name = obj.get("name", "unknown")
+                            if isinstance(name, int):
+                                labels.append(name)
+                            else:
+                                # Simple hash-based label (in production, use proper class mapping)
+                                labels.append(hash(name) % 20)  # 20 classes for VOC
+            
+            # Create target tensor
+            if boxes:
+                target_tensor = {
+                    "boxes": torch.tensor(boxes, dtype=torch.float32),
+                    "labels": torch.tensor(labels, dtype=torch.long),
+                }
+            else:
+                # Empty image - create dummy boxes
+                target_tensor = {
+                    "boxes": torch.zeros((0, 4), dtype=torch.float32),
+                    "labels": torch.zeros((0,), dtype=torch.long),
+                }
+            targets.append(target_tensor)
+        else:
+            # Fallback: assume target is already in correct format
+            targets.append(target)
+
+    images = torch.stack(images)
+    return images, targets
 
 

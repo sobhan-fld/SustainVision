@@ -170,6 +170,58 @@ hyperparameters:
 
 This gives you 8 cycles × (50 + 20) = 560 total epochs with automatic phase switching.
 
+### Option 3: Multi-Head Evaluation (Train Once, Evaluate Multiple Tasks)
+
+After training a feature space (e.g., SupCon with MobileNet Small on CIFAR-10), you can
+evaluate the same pretrained backbone with different task-specific heads without
+retraining the backbone:
+
+1. **Train your feature space** using Option 1 or Option 2 above
+2. **Enable evaluation mode** in your config:
+   ```yaml
+   evaluation:
+     enabled: true
+     checkpoint_path: outputs/your_model_cycle1.pt
+     head_type: classification  # or "detection"
+   ```
+3. **Run evaluation** from the main menu: "Evaluate pretrained model"
+
+The evaluation system:
+- Loads your pretrained backbone (frozen)
+- Attaches a task-specific head (classification or object detection)
+- Trains only the head while keeping the backbone frozen
+- Reports evaluation metrics
+
+**Example workflow:**
+```yaml
+# Step 1: Train feature space with SupCon
+model: mobilenet_v3_small
+database: databases/cifar10
+loss_function: supcon
+simclr_schedule:
+  enabled: true
+  cycles: 10
+  pretrain_epochs: 100
+  pretrain_loss: supcon
+
+# Step 2: Evaluate with classification head
+evaluation:
+  enabled: true
+  checkpoint_path: outputs/mobilenet_small_supcon_cifar10_cycle1.pt
+  head_type: classification
+
+# Step 3: Evaluate with detection head (same backbone!)
+evaluation:
+  enabled: true
+  checkpoint_path: outputs/mobilenet_small_supcon_cifar10_cycle1.pt
+  head_type: detection
+  num_anchors: 9
+  hidden_dim: 256
+```
+
+This allows you to train the feature space once and evaluate it on multiple downstream
+tasks, demonstrating the transferability of learned representations.
+
 Programmatic Access
 -------------------
 

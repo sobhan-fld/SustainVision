@@ -613,7 +613,45 @@ def _execute_training_phase(
     if scheduler is not None and scheduler_state is not None:
         try:
             scheduler.load_state_dict(scheduler_state)
-            print(f"[info] Loaded scheduler state to continue from previous cycle")
+            # After loading scheduler state, sync optimizer LR to match scheduler's computed LR
+            # This prevents LR reset when optimizer_reset=True creates a new optimizer
+            # The scheduler computes LR based on its internal state (last_epoch, t_max, etc.)
+            # but the optimizer's param_groups still have the initial LR
+            # We need to get the current LR that the scheduler would compute
+            try:
+                # For CosineAnnealingLR and SequentialLR, get_last_lr() should work
+                # However, after loading state, we may need to trigger LR computation
+                # by accessing the scheduler's internal state or calling get_last_lr()
+                if hasattr(scheduler, 'get_last_lr'):
+                    # get_last_lr() returns the LR that was computed at the last step
+                    # After loading state, this should reflect the loaded state
+                    current_lr_from_scheduler = scheduler.get_last_lr()[0]
+                elif hasattr(scheduler, 'base_lrs') and hasattr(scheduler, 'last_epoch'):
+                    # Manual computation for CosineAnnealingLR: eta_min + (base_lr - eta_min) * (1 + cos(pi * last_epoch / T_max)) / 2
+                    import math  # type: ignore[import]
+                    base_lr = scheduler.base_lrs[0] if scheduler.base_lrs else learning_rate
+                    eta_min = getattr(scheduler, 'eta_min', 0.0)
+                    t_max = getattr(scheduler, 'T_max', 1)
+                    last_epoch = scheduler.last_epoch
+                    if t_max > 0:
+                        current_lr_from_scheduler = eta_min + (base_lr - eta_min) * (1 + math.cos(math.pi * last_epoch / t_max)) / 2
+                    else:
+                        current_lr_from_scheduler = base_lr
+                else:
+                    current_lr_from_scheduler = None
+                
+                if current_lr_from_scheduler is not None:
+                    # Update all param groups to match the scheduler's computed LR
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = current_lr_from_scheduler
+                    print(f"[info] Loaded scheduler state to continue from previous cycle (LR synced to {current_lr_from_scheduler:.6f})")
+                else:
+                    # Fallback: scheduler will compute the correct LR on the next step()
+                    print(f"[info] Loaded scheduler state to continue from previous cycle (LR will sync on first step)")
+            except (AttributeError, IndexError, TypeError, ZeroDivisionError) as e:
+                # Fallback: scheduler doesn't support the expected interface
+                # In this case, the scheduler will compute the correct LR on the next step()
+                print(f"[info] Loaded scheduler state to continue from previous cycle (LR will sync on first step, error: {e})")
         except Exception as e:
             print(f"[warn] Failed to load scheduler state: {e}. Starting with fresh scheduler.")
 
