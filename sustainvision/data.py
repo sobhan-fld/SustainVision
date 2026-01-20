@@ -661,6 +661,8 @@ def build_detection_dataloaders(
     seed: int = 42,
     project_root: Optional[Path] = None,
     image_size: int = 224,
+    max_train_images: Optional[int] = None,
+    max_val_images: Optional[int] = None,
 ) -> Tuple["DataLoader", "DataLoader", int]:  # type: ignore[name-defined]
     """Build dataloaders for object detection datasets (COCO, Pascal VOC, tiny synthetic).
     
@@ -820,6 +822,8 @@ def build_detection_dataloaders(
             transform=transform,
         )
 
+        from torch.utils.data import Subset
+
         if val_images.exists() and val_ann.exists():
             val_dataset = tv_datasets.CocoDetection(
                 root=str(val_images),
@@ -828,12 +832,30 @@ def build_detection_dataloaders(
             )
         else:
             print("[warn] COCO validation set not found, using train set split")
-            from torch.utils.data import Subset
             total = len(train_dataset)
             val_count = max(1, int(total * 0.1))  # 10% for validation
             indices = torch.randperm(total, generator=torch.Generator().manual_seed(seed))
             val_dataset = Subset(train_dataset, indices[:val_count].tolist())
             train_dataset = Subset(train_dataset, indices[val_count:].tolist())
+
+        # Optional: limit dataset size for quick tests
+        if max_train_images is not None:
+            try:
+                max_train_images_int = max(1, int(max_train_images))
+                if len(train_dataset) > max_train_images_int:
+                    train_dataset = Subset(train_dataset, list(range(max_train_images_int)))
+                    print(f"[info] Limiting COCO train to {max_train_images_int} images (quick test).")
+            except Exception:
+                pass
+
+        if max_val_images is not None:
+            try:
+                max_val_images_int = max(1, int(max_val_images))
+                if len(val_dataset) > max_val_images_int:
+                    val_dataset = Subset(val_dataset, list(range(max_val_images_int)))
+                    print(f"[info] Limiting COCO val to {max_val_images_int} images (quick test).")
+            except Exception:
+                pass
 
         # COCO has 80 classes (1-90, but some IDs are skipped)
         num_classes = 80
@@ -921,6 +943,21 @@ def _collate_detection_batch(batch: list) -> Tuple["torch.Tensor", list]:  # typ
     images = []
     targets = []
 
+    # COCO uses non-contiguous category IDs in [1..90] with gaps.
+    # Map them to contiguous [0..79] indices expected by most models/losses.
+    coco_category_ids = [
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+        11, 13, 14, 15, 16, 17, 18, 19, 20,
+        21, 22, 23, 24, 25, 27, 28,
+        31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+        41, 42, 43, 44, 46, 47, 48, 49, 50,
+        51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
+        61, 62, 63, 64, 65, 67, 70, 72, 73, 74,
+        75, 76, 77, 78, 79, 80, 81, 82, 84, 85,
+        86, 87, 88, 89, 90,
+    ]
+    coco_id_to_contiguous = {cid: idx for idx, cid in enumerate(coco_category_ids)}
+
     for image, target in batch:
         images.append(image)
         
@@ -935,9 +972,14 @@ def _collate_detection_batch(batch: list) -> Tuple["torch.Tensor", list]:  # typ
                     # COCO bbox format: [x, y, width, height] -> [x1, y1, x2, y2]
                     x, y, w, h = ann["bbox"]
                     boxes.append([x, y, x + w, y + h])
-                    # COCO category_id is 1-indexed, convert to 0-indexed
-                    cat_id = ann.get("category_id", 0)
-                    labels.append(max(0, cat_id - 1))
+                    # Convert COCO category_id to contiguous [0..79]
+                    cat_id = ann.get("category_id", None)
+                    mapped = coco_id_to_contiguous.get(cat_id) if cat_id is not None else None
+                    if mapped is None:
+                        # Skip unknown/unsupported category IDs
+                        boxes.pop()
+                        continue
+                    labels.append(mapped)
                 elif "segmentation" in ann:
                     # Some COCO annotations might have segmentation but not bbox
                     continue

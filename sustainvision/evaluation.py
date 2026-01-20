@@ -366,6 +366,8 @@ def evaluate_with_head(
             seed=config.seed,
             project_root=project_root,
             image_size=config.hyperparameters.get("image_size", 224),
+            max_train_images=config.hyperparameters.get("max_train_images"),
+            max_val_images=config.hyperparameters.get("max_val_images"),
         )
     else:
         # Use classification dataloaders for classification
@@ -519,6 +521,17 @@ def _evaluate_detection(
     )
     
     epochs = config.hyperparameters.get("epochs", 10)
+    log_every = int(config.hyperparameters.get("log_every", 50) or 50)
+    max_train_batches = config.hyperparameters.get("max_train_batches")
+    max_val_batches = config.hyperparameters.get("max_val_batches")
+    try:
+        max_train_batches = int(max_train_batches) if max_train_batches is not None else None
+    except Exception:
+        max_train_batches = None
+    try:
+        max_val_batches = int(max_val_batches) if max_val_batches is not None else None
+    except Exception:
+        max_val_batches = None
     
     print("[info] Training detection head with real bounding box annotations")
     print("[warn] This is a simplified implementation. For production, add anchor generation, NMS, and mAP.")
@@ -534,7 +547,9 @@ def _evaluate_detection(
         train_bbox_loss = 0.0
         train_samples = 0
         
-        for images, targets in train_loader:
+        for batch_idx, (images, targets) in enumerate(train_loader):
+            if max_train_batches is not None and batch_idx >= max_train_batches:
+                break
             images = images.to(device)
             
             optimizer.zero_grad()
@@ -608,6 +623,9 @@ def _evaluate_detection(
                 train_cls_loss += (total_cls_loss / valid_samples).item() if valid_samples > 0 else 0
                 train_bbox_loss += (total_bbox_loss / valid_samples).item() if valid_samples > 0 else 0
                 train_samples += valid_samples
+
+            if log_every > 0 and (batch_idx + 1) % log_every == 0:
+                print(f"[info] epoch {epoch+1}/{epochs} - train batch {batch_idx+1}")
         
         avg_train_loss = train_loss / len(train_loader) if len(train_loader) > 0 else 0.0
         avg_train_cls_loss = train_cls_loss / len(train_loader) if len(train_loader) > 0 else 0.0
@@ -620,7 +638,9 @@ def _evaluate_detection(
         val_bbox_loss = 0.0
         
         with torch.no_grad():
-            for images, targets in val_loader:
+            for batch_idx, (images, targets) in enumerate(val_loader):
+                if max_val_batches is not None and batch_idx >= max_val_batches:
+                    break
                 images = images.to(device)
                 
                 cls_logits, bbox_preds = model(images)
