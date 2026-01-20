@@ -662,7 +662,7 @@ def build_detection_dataloaders(
     project_root: Optional[Path] = None,
     image_size: int = 224,
 ) -> Tuple["DataLoader", "DataLoader", int]:  # type: ignore[name-defined]
-    """Build dataloaders for object detection datasets (COCO, Pascal VOC).
+    """Build dataloaders for object detection datasets (COCO, Pascal VOC, tiny synthetic).
     
     Returns dataloaders that yield (image, target) where target contains:
     - 'boxes': [N, 4] tensor of bounding boxes in (x1, y1, x2, y2) format
@@ -708,12 +708,83 @@ def build_detection_dataloaders(
     image_size = max(32, int(image_size))
     num_workers = max(0, int(num_workers))
 
-    # Define transforms
-    transform = transforms.Compose([
-        transforms.Resize((image_size, image_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
+    # Define transforms (used for real datasets; synthetic toy dataset works directly with tensors)
+    transform = transforms.Compose(
+        [
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+        ]
+    )
+
+    # ------------------------------------------------------------------
+    # Tiny synthetic detection dataset for quickly testing the pipeline
+    # ------------------------------------------------------------------
+    if database_lower in {"toy_detection", "tiny_detection", "synthetic_detection"}:
+        # Very small dataset: a handful of randomly generated images with 1–3 boxes
+        # and a small number of classes. This is only meant for sanity‑checking
+        # that the detection pipeline (model forward, loss, training loop) works.
+        num_classes = 3
+
+        class _TinyDetectionDataset(torch.utils.data.Dataset):  # type: ignore[attr-defined]
+            def __init__(self, length: int, image_size: int, seed_value: int) -> None:
+                self.length = length
+                self.image_size = image_size
+                self.generator = torch.Generator().manual_seed(seed_value)
+
+            def __len__(self) -> int:
+                return self.length
+
+            def __getitem__(self, idx):  # type: ignore[override]
+                # Random image in [0, 1]
+                img = torch.rand(3, self.image_size, self.image_size, generator=self.generator)
+
+                # 1–3 random boxes per image
+                num_boxes = int(torch.randint(1, 4, (1,), generator=self.generator).item())
+                boxes = []
+                labels = []
+                for _ in range(num_boxes):
+                    x1 = torch.randint(0, self.image_size - 4, (1,), generator=self.generator).item()
+                    y1 = torch.randint(0, self.image_size - 4, (1,), generator=self.generator).item()
+                    x2 = torch.randint(x1 + 2, self.image_size, (1,), generator=self.generator).item()
+                    y2 = torch.randint(y1 + 2, self.image_size, (1,), generator=self.generator).item()
+                    boxes.append([float(x1), float(y1), float(x2), float(y2)])
+
+                    # Labels in [0, num_classes-1]
+                    label = int(torch.randint(0, num_classes, (1,), generator=self.generator).item())
+                    labels.append(label)
+
+                target = {
+                    "boxes": torch.tensor(boxes, dtype=torch.float32),
+                    "labels": torch.tensor(labels, dtype=torch.long),
+                }
+                return img, target
+
+        # Use a tiny split for fast tests
+        train_dataset = _TinyDetectionDataset(length=32, image_size=image_size, seed_value=seed)
+        val_dataset = _TinyDetectionDataset(length=16, image_size=image_size, seed_value=seed + 1)
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            collate_fn=_collate_detection_batch,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            collate_fn=_collate_detection_batch,
+        )
+
+        return train_loader, val_loader, num_classes
 
     # Load COCO dataset
     if database_lower == "coco":
@@ -853,29 +924,27 @@ def _collate_detection_batch(batch: list) -> Tuple["torch.Tensor", list]:  # typ
     for image, target in batch:
         images.append(image)
         
-        # Torchvision COCO/VOC datasets return target as dict
-        if isinstance(target, dict):
-            boxes = []
-            labels = []
-            
-            # COCO format: target is a dict with list of annotation dicts
-            annotations = target.get("annotations", [])
-            if annotations:
-                for ann in annotations:
-                    if "bbox" in ann:
-                        # COCO bbox format: [x, y, width, height] -> [x1, y1, x2, y2]
-                        bbox = ann["bbox"]
-                        x, y, w, h = bbox
-                        boxes.append([x, y, x + w, y + h])
-                        # COCO category_id is 1-indexed, convert to 0-indexed
-                        cat_id = ann.get("category_id", 0)
-                        labels.append(max(0, cat_id - 1))  # Convert to 0-indexed
-                    elif "segmentation" in ann:
-                        # Some COCO annotations might have segmentation but not bbox
-                        continue
-            
-            # Pascal VOC format: target is dict with 'annotation' key containing 'object' list
-            if not boxes and "annotation" in target:
+        boxes = []
+        labels = []
+
+        # Torchvision COCO: target is a **list** of annotation dicts
+        if isinstance(target, list):
+            annotations = target
+            for ann in annotations:
+                if "bbox" in ann:
+                    # COCO bbox format: [x, y, width, height] -> [x1, y1, x2, y2]
+                    x, y, w, h = ann["bbox"]
+                    boxes.append([x, y, x + w, y + h])
+                    # COCO category_id is 1-indexed, convert to 0-indexed
+                    cat_id = ann.get("category_id", 0)
+                    labels.append(max(0, cat_id - 1))
+                elif "segmentation" in ann:
+                    # Some COCO annotations might have segmentation but not bbox
+                    continue
+
+        # Pascal VOC: target is a dict with 'annotation' key
+        elif isinstance(target, dict):
+            if "annotation" in target:
                 annotation = target["annotation"]
                 objects = annotation.get("object", [])
                 if isinstance(objects, list):
@@ -887,31 +956,26 @@ def _collate_detection_batch(batch: list) -> Tuple["torch.Tensor", list]:  # typ
                             x2 = float(bbox.get("xmax", 0))
                             y2 = float(bbox.get("ymax", 0))
                             boxes.append([x1, y1, x2, y2])
-                            # Pascal VOC class names need to be converted to IDs
-                            # For now, use a simple hash or index
+                            # Simple VOC class → ID mapping placeholder
                             name = obj.get("name", "unknown")
                             if isinstance(name, int):
                                 labels.append(name)
                             else:
-                                # Simple hash-based label (in production, use proper class mapping)
                                 labels.append(hash(name) % 20)  # 20 classes for VOC
-            
-            # Create target tensor
-            if boxes:
-                target_tensor = {
-                    "boxes": torch.tensor(boxes, dtype=torch.float32),
-                    "labels": torch.tensor(labels, dtype=torch.long),
-                }
-            else:
-                # Empty image - create dummy boxes
-                target_tensor = {
-                    "boxes": torch.zeros((0, 4), dtype=torch.float32),
-                    "labels": torch.zeros((0,), dtype=torch.long),
-                }
-            targets.append(target_tensor)
+
+        # Create target tensor (shared for COCO/VOC)
+        if boxes:
+            target_tensor = {
+                "boxes": torch.tensor(boxes, dtype=torch.float32),
+                "labels": torch.tensor(labels, dtype=torch.long),
+            }
         else:
-            # Fallback: assume target is already in correct format
-            targets.append(target)
+            # Empty image - create dummy boxes
+            target_tensor = {
+                "boxes": torch.zeros((0, 4), dtype=torch.float32),
+                "labels": torch.zeros((0,), dtype=torch.long),
+            }
+        targets.append(target_tensor)
 
     images = torch.stack(images)
     return images, targets

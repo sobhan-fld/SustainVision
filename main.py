@@ -69,14 +69,16 @@ def _start_evaluation(cm: ConfigManager) -> None:
     print(f"[info] Model: {config.model}")
     print(f"[info] Dataset: {config.database}\n")
     
-    output_root = Path.cwd() / "outputs"
+    # For evaluation, treat the **project root** as the current working directory.
+    # Dataset paths (e.g. `databases/coco`) are resolved relative to this root.
+    project_root = Path.cwd()
     
     try:
         results = evaluate_with_head(
             config,
             checkpoint_path,
             head_type=head_type,
-            project_root=output_root,
+            project_root=project_root,
             num_anchors=eval_cfg.get("num_anchors", 9),
             hidden_dim=eval_cfg.get("hidden_dim", 256),
         )
@@ -125,7 +127,14 @@ def _choose_and_run_config(configs_dir: Path) -> None:
 
     config_path = str(yaml_files[selected_idx])
     cm = ConfigManager(config_path)
-    _start_training(cm)
+    cfg = cm.load()
+
+    # If evaluation is enabled in this config, run evaluation instead of training.
+    eval_cfg = getattr(cfg, "evaluation", {}) or {}
+    if eval_cfg.get("enabled", False):
+        _start_evaluation(cm)
+    else:
+        _start_training(cm)
 def _show_devices() -> None:
     """Print available CPU/GPU devices and basic utilization info."""
 

@@ -200,7 +200,34 @@ def load_pretrained_backbone(
         raise ValueError(f"No model state found in checkpoint: {checkpoint_path}")
     
     # Load state into model
-    temp_model.load_state_dict(model_state, strict=False)
+    #
+    # We often reuse backbones trained on classification tasks (e.g., CIFAR100)
+    # for detection with different heads and num_classes. That means some
+    # parameters (e.g., classifier layers, small‑image conv1 tweaks) may not
+    # match the architecture we're building here (e.g., COCO detection with
+    # different image_size / num_classes).
+    #
+    # `strict=False` ignores missing/unexpected keys, but **shape mismatches
+    # still raise errors**, so we proactively filter any tensors whose shapes
+    # don't match before loading.
+    current_state = temp_model.state_dict()
+    filtered_state = {}
+    skipped_keys = []
+    for key, value in model_state.items():
+        if key not in current_state:
+            continue
+        if current_state[key].shape != value.shape:
+            skipped_keys.append(key)
+            continue
+        filtered_state[key] = value
+
+    if skipped_keys:
+        print(
+            "[info] Skipping incompatible checkpoint parameters when loading backbone:\n"
+            f"  {', '.join(sorted(skipped_keys))}"
+        )
+
+    temp_model.load_state_dict(filtered_state, strict=False)
     
     # Extract backbone
     if not hasattr(temp_model, "backbone"):
@@ -524,8 +551,9 @@ def _evaluate_detection(
             
             for i in range(batch_size):
                 target = targets[i]
-                gt_boxes = target.get("boxes", torch.zeros((0, 4), device=device))
-                gt_labels = target.get("labels", torch.zeros((0,), dtype=torch.long, device=device))
+                # Ensure GT tensors are on the same device as model outputs
+                gt_boxes = target.get("boxes", torch.zeros((0, 4))).to(device)
+                gt_labels = target.get("labels", torch.zeros((0,), dtype=torch.long)).to(device)
                 
                 if len(gt_boxes) == 0:
                     # Skip images with no objects (background)
@@ -540,8 +568,23 @@ def _evaluate_detection(
                 if len(assigned_anchors) > 0:
                     assigned_cls_logits = cls_logits[i, assigned_anchors]  # [num_assigned, num_classes]
                     assigned_labels = gt_labels[:len(assigned_anchors)]
-                    cls_loss = cls_criterion(assigned_cls_logits, assigned_labels).mean()
-                    total_cls_loss += cls_loss
+                    # Guard against invalid class indices from dataset
+                    valid_mask = (assigned_labels >= 0) & (assigned_labels < num_classes)
+                    if valid_mask.any():
+                        assigned_cls_logits = assigned_cls_logits[valid_mask]
+                        assigned_labels = assigned_labels[valid_mask]
+                        cls_loss = cls_criterion(assigned_cls_logits, assigned_labels).mean()
+                        total_cls_loss += cls_loss
+                if len(assigned_anchors) > 0:
+                    assigned_cls_logits = cls_logits[i, assigned_anchors]  # [num_assigned, num_classes]
+                    assigned_labels = gt_labels[:len(assigned_anchors)]
+                    # Guard against invalid class indices from dataset
+                    valid_mask = (assigned_labels >= 0) & (assigned_labels < num_classes)
+                    if valid_mask.any():
+                        assigned_cls_logits = assigned_cls_logits[valid_mask]
+                        assigned_labels = assigned_labels[valid_mask]
+                        cls_loss = cls_criterion(assigned_cls_logits, assigned_labels).mean()
+                        total_cls_loss += cls_loss
                 
                 # Bbox loss: predict box coordinates for assigned anchors
                 if len(assigned_anchors) > 0:
@@ -589,8 +632,9 @@ def _evaluate_detection(
                 
                 for i in range(batch_size):
                     target = targets[i]
-                    gt_boxes = target.get("boxes", torch.zeros((0, 4), device=device))
-                    gt_labels = target.get("labels", torch.zeros((0,), dtype=torch.long, device=device))
+                    # Ensure GT tensors are on the same device as model outputs
+                    gt_boxes = target.get("boxes", torch.zeros((0, 4))).to(device)
+                    gt_labels = target.get("labels", torch.zeros((0,), dtype=torch.long)).to(device)
                     
                     if len(gt_boxes) == 0:
                         continue

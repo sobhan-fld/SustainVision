@@ -17,3 +17,4 @@ torchvision>=0.16.0; platform_system != "Darwin" or platform_machine != "arm64"
 colorama>=0.4.6; platform_system == "Windows"
 # Optional: Lion optimizer support
 lion-pytorch>=0.1.2
+pycocotools>=2.0.7
