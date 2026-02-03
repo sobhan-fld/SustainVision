@@ -133,6 +133,11 @@ class TrainingConfig:
             "head_type": "classification",  # "classification" or "detection"
             "num_anchors": 9,  # For detection head
             "hidden_dim": 256,  # For detection head
+            # Detection-eval extras
+            "save_predictions": False,
+            "predictions_path": None,  # Optional override path for COCO JSON predictions
+            "nms_threshold": 0.5,
+            "map_iou_thresholds": None,  # None means COCO default [0.5:0.95]
         }
     )
     hyperparameters: Dict[str, Any] = field(

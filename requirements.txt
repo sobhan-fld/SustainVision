@@ -13,6 +13,8 @@ seaborn>=0.12.0
 torch>=2.1.0; platform_system != "Darwin" or platform_machine != "arm64"
 # Optional: torchvision enables dataset downloads (CIFAR10, MNIST, ...)
 torchvision>=0.16.0; platform_system != "Darwin" or platform_machine != "arm64"
+# COCO mAP evaluation (required for full COCO-style mAP@[0.5:0.95] in detection evaluation)
+pycocotools>=2.0.7; platform_system == "Linux"
 # Optional: colorama improves CLI colors on Windows terminals
 colorama>=0.4.6; platform_system == "Windows"
 # Optional: Lion optimizer support

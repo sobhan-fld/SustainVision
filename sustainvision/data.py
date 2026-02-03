@@ -23,6 +23,85 @@ class DatasetPreparationError(RuntimeError):
     """Raised when a dataset cannot be prepared for training."""
 
 
+# ---------------------------------------------------------------------------
+# COCO category mapping (COCO category IDs are non-contiguous and have gaps).
+# We map them to contiguous indices [0..79] expected by most heads/losses.
+# ---------------------------------------------------------------------------
+COCO_CATEGORY_IDS: list[int] = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    11, 13, 14, 15, 16, 17, 18, 19, 20,
+    21, 22, 23, 24, 25, 27, 28,
+    31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+    41, 42, 43, 44, 46, 47, 48, 49, 50,
+    51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
+    61, 62, 63, 64, 65, 67, 70, 72, 73, 74,
+    75, 76, 77, 78, 79, 80, 81, 82, 84, 85,
+    86, 87, 88, 89, 90,
+]
+COCO_ID_TO_CONTIGUOUS: dict[int, int] = {cid: idx for idx, cid in enumerate(COCO_CATEGORY_IDS)}
+COCO_CONTIGUOUS_TO_ID: dict[int, int] = {idx: cid for idx, cid in enumerate(COCO_CATEGORY_IDS)}
+
+# COCO class names (in order matching COCO_CATEGORY_IDS indices [0..79])
+COCO_CLASS_NAMES: list[str] = [
+    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck',
+    'boat', 'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench',
+    'bird', 'cat', 'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra',
+    'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
+    'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove',
+    'skateboard', 'surfboard', 'tennis racket', 'bottle', 'wine glass', 'cup',
+    'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange',
+    'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
+    'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse',
+    'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
+    'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier',
+    'toothbrush'
+]
+
+# CIFAR-100 classes that overlap with COCO (semantic matches)
+# Maps CIFAR-100 class names to COCO class names
+CIFAR100_TO_COCO_MAPPING: dict[str, list[str]] = {
+    # Animals
+    'bird': ['bird'],
+    'cat': ['cat'],
+    'dog': ['dog'],
+    'horse': ['horse'],
+    'sheep': ['sheep'],
+    'cow': ['cow'],
+    'bear': ['bear'],
+    # Vehicles
+    'bicycle': ['bicycle'],
+    'motorcycle': ['motorcycle'],
+    'automobile': ['car'],
+    'bus': ['bus'],
+    'truck': ['truck'],
+    'train': ['train'],
+    # Furniture
+    'chair': ['chair'],
+    'couch': ['couch'],
+    'bed': ['bed'],
+    'table': ['dining table'],
+    # Food
+    'apple': ['apple'],
+    'orange': ['orange'],
+    'banana': ['banana'],
+}
+
+def get_coco_classes_for_cifar100() -> set[int]:
+    """Return set of COCO contiguous class indices [0..79] that match CIFAR-100 classes.
+    
+    This filters COCO to only classes that semantically overlap with CIFAR-100,
+    reducing the detection task from 80 classes to ~20-30 overlapping classes.
+    """
+    coco_classes_to_keep = set()
+    for coco_idx, coco_name in enumerate(COCO_CLASS_NAMES):
+        # Check if this COCO class matches any CIFAR-100 class
+        for cifar_class, coco_matches in CIFAR100_TO_COCO_MAPPING.items():
+            if coco_name in coco_matches:
+                coco_classes_to_keep.add(coco_idx)
+                break
+    return coco_classes_to_keep
+
+
 def _require_torchvision() -> "module":  # type: ignore[override]
     try:
         import torchvision.datasets as datasets
@@ -663,6 +742,7 @@ def build_detection_dataloaders(
     image_size: int = 224,
     max_train_images: Optional[int] = None,
     max_val_images: Optional[int] = None,
+    filter_classes: Optional[set[int]] = None,  # Set of COCO class indices [0..79] to keep
 ) -> Tuple["DataLoader", "DataLoader", int]:  # type: ignore[name-defined]
     """Build dataloaders for object detection datasets (COCO, Pascal VOC, tiny synthetic).
     
@@ -710,17 +790,144 @@ def build_detection_dataloaders(
     image_size = max(32, int(image_size))
     num_workers = max(0, int(num_workers))
 
-    # Define transforms (used for real datasets; synthetic toy dataset works directly with tensors)
-    transform = transforms.Compose(
-        [
-            transforms.Resize((image_size, image_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-            ),
-        ]
-    )
+    # Define transforms for detection datasets.
+    # IMPORTANT: detection targets (boxes) must be consistent with the transformed image.
+    # We therefore build a callable that returns:
+    # - image tensor resized to (image_size, image_size) and normalized
+    # - target dict with normalized boxes in xyxy format (0..1), labels, image_id, orig_size
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+
+    def _to_tensor_and_normalize(img):
+        from torchvision.transforms import functional as TF  # type: ignore
+
+        img = TF.resize(img, [image_size, image_size])
+        tensor = TF.to_tensor(img)
+        tensor = TF.normalize(tensor, mean=mean, std=std)
+        return tensor
+
+    # Create class remapping if filtering is enabled
+    class_remap: Optional[dict[int, int]] = None
+    if filter_classes is not None and len(filter_classes) > 0:
+        # Create mapping from original COCO indices [0..79] to new contiguous indices [0..len(filter_classes)-1]
+        sorted_classes = sorted(filter_classes)
+        class_remap = {old_idx: new_idx for new_idx, old_idx in enumerate(sorted_classes)}
+        print(f"[info] Filtering COCO classes: keeping {len(filter_classes)}/{len(COCO_CATEGORY_IDS)} classes")
+        print(f"[info]   Kept classes: {sorted_classes}")
+        print(f"[info]   Class names: {[COCO_CLASS_NAMES[i] for i in sorted_classes[:10]]}{'...' if len(sorted_classes) > 10 else ''}")
+
+    def _parse_coco_annotations(annotations: list, orig_w: int, orig_h: int) -> Tuple["torch.Tensor", "torch.Tensor", int]:
+        boxes: list[list[float]] = []
+        labels: list[int] = []
+        image_id = -1
+        for ann in annotations:
+            if not isinstance(ann, dict):
+                continue
+            if image_id == -1:
+                try:
+                    image_id = int(ann.get("image_id", -1))
+                except Exception:
+                    image_id = -1
+            bbox = ann.get("bbox")
+            if not bbox:
+                continue
+            try:
+                x, y, w, h = bbox
+                x1 = float(x)
+                y1 = float(y)
+                x2 = float(x) + float(w)
+                y2 = float(y) + float(h)
+            except Exception:
+                continue
+
+            cat_id = ann.get("category_id", None)
+            mapped = COCO_ID_TO_CONTIGUOUS.get(int(cat_id)) if cat_id is not None else None
+            if mapped is None:
+                continue
+            
+            # Filter classes if filter_classes is provided
+            if filter_classes is not None and mapped not in filter_classes:
+                continue
+            
+            # Remap class index if filtering is enabled
+            if class_remap is not None:
+                mapped = class_remap[mapped]
+
+            # Normalize to [0,1] in xyxy format relative to resized image_size
+            # Scale boxes from original image coordinates to resized image coordinates
+            if orig_w > 0 and orig_h > 0:
+                scale_x = image_size / orig_w
+                scale_y = image_size / orig_h
+                # Scale boxes to resized image coordinates, then normalize to [0,1]
+                boxes.append([
+                    (x1 * scale_x) / image_size,
+                    (y1 * scale_y) / image_size,
+                    (x2 * scale_x) / image_size,
+                    (y2 * scale_y) / image_size,
+                ])
+                labels.append(int(mapped))
+
+        if boxes:
+            return (
+                torch.tensor(boxes, dtype=torch.float32),
+                torch.tensor(labels, dtype=torch.long),
+                image_id,
+            )
+        return (
+            torch.zeros((0, 4), dtype=torch.float32),
+            torch.zeros((0,), dtype=torch.long),
+            image_id,
+        )
+
+    def _parse_voc_target(voc_target: dict, orig_w: int, orig_h: int) -> Tuple["torch.Tensor", "torch.Tensor", int]:
+        boxes: list[list[float]] = []
+        labels: list[int] = []
+        image_id = -1
+        annotation = voc_target.get("annotation") if isinstance(voc_target, dict) else None
+        if isinstance(annotation, dict):
+            objects = annotation.get("object", [])
+            if isinstance(objects, dict):
+                objects = [objects]
+            if isinstance(objects, list):
+                for obj in objects:
+                    if not isinstance(obj, dict):
+                        continue
+                    bbox = obj.get("bndbox")
+                    if not isinstance(bbox, dict):
+                        continue
+                    try:
+                        x1 = float(bbox.get("xmin", 0))
+                        y1 = float(bbox.get("ymin", 0))
+                        x2 = float(bbox.get("xmax", 0))
+                        y2 = float(bbox.get("ymax", 0))
+                    except Exception:
+                        continue
+                    name = obj.get("name", "unknown")
+                    # Stable-ish mapping: keep it in [0..19]
+                    label = int(name) if isinstance(name, int) else (hash(str(name)) % 20)
+                    if orig_w > 0 and orig_h > 0:
+                        # Scale boxes from original image coordinates to resized image coordinates
+                        scale_x = image_size / orig_w
+                        scale_y = image_size / orig_h
+                        # Scale boxes to resized image coordinates, then normalize to [0,1]
+                        boxes.append([
+                            (x1 * scale_x) / image_size,
+                            (y1 * scale_y) / image_size,
+                            (x2 * scale_x) / image_size,
+                            (y2 * scale_y) / image_size,
+                        ])
+                        labels.append(label)
+        if boxes:
+            return (
+                torch.tensor(boxes, dtype=torch.float32),
+                torch.tensor(labels, dtype=torch.long),
+                image_id,
+            )
+        return (
+            torch.zeros((0, 4), dtype=torch.float32),
+            torch.zeros((0,), dtype=torch.long),
+            image_id,
+        )
 
     # ------------------------------------------------------------------
     # Tiny synthetic detection dataset for quickly testing the pipeline
@@ -816,10 +1023,22 @@ def build_detection_dataloaders(
                 f"  {train_ann}"
             )
 
+        def _coco_transforms(img, target):
+            # img is PIL; target is list[dict]
+            orig_w, orig_h = img.size
+            image_tensor = _to_tensor_and_normalize(img)
+            boxes_t, labels_t, image_id = _parse_coco_annotations(target if isinstance(target, list) else [], orig_w, orig_h)
+            return image_tensor, {
+                "boxes": boxes_t,
+                "labels": labels_t,
+                "image_id": int(image_id),
+                "orig_size": torch.tensor([orig_h, orig_w], dtype=torch.int64),
+            }
+
         train_dataset = tv_datasets.CocoDetection(
             root=str(train_images),
             annFile=str(train_ann),
-            transform=transform,
+            transforms=_coco_transforms,
         )
 
         from torch.utils.data import Subset
@@ -828,7 +1047,7 @@ def build_detection_dataloaders(
             val_dataset = tv_datasets.CocoDetection(
                 root=str(val_images),
                 annFile=str(val_ann),
-                transform=transform,
+                transforms=_coco_transforms,
             )
         else:
             print("[warn] COCO validation set not found, using train set split")
@@ -858,7 +1077,11 @@ def build_detection_dataloaders(
                 pass
 
         # COCO has 80 classes (1-90, but some IDs are skipped)
-        num_classes = 80
+        # If filtering is enabled, use filtered class count
+        if filter_classes is not None and len(filter_classes) > 0:
+            num_classes = len(filter_classes)
+        else:
+            num_classes = 80
 
     # Load Pascal VOC dataset
     elif database_lower in {"voc", "pascal_voc"}:
@@ -875,11 +1098,22 @@ def build_detection_dataloaders(
                     "Please download it first using 'Download databases' menu."
                 )
 
+        def _voc_transforms(img, target):
+            orig_w, orig_h = img.size
+            image_tensor = _to_tensor_and_normalize(img)
+            boxes_t, labels_t, image_id = _parse_voc_target(target if isinstance(target, dict) else {}, orig_w, orig_h)
+            return image_tensor, {
+                "boxes": boxes_t,
+                "labels": labels_t,
+                "image_id": int(image_id),
+                "orig_size": torch.tensor([orig_h, orig_w], dtype=torch.int64),
+            }
+
         train_dataset = tv_datasets.VOCDetection(
             root=str(voc_root),
             year="2012",
             image_set="train",
-            transform=transform,
+            transforms=_voc_transforms,
             download=False,
         )
 
@@ -888,7 +1122,7 @@ def build_detection_dataloaders(
                 root=str(voc_root),
                 year="2012",
                 image_set="val",
-                transform=transform,
+                transforms=_voc_transforms,
                 download=False,
             )
         except Exception:
@@ -943,24 +1177,15 @@ def _collate_detection_batch(batch: list) -> Tuple["torch.Tensor", list]:  # typ
     images = []
     targets = []
 
-    # COCO uses non-contiguous category IDs in [1..90] with gaps.
-    # Map them to contiguous [0..79] indices expected by most models/losses.
-    coco_category_ids = [
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
-        11, 13, 14, 15, 16, 17, 18, 19, 20,
-        21, 22, 23, 24, 25, 27, 28,
-        31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
-        41, 42, 43, 44, 46, 47, 48, 49, 50,
-        51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
-        61, 62, 63, 64, 65, 67, 70, 72, 73, 74,
-        75, 76, 77, 78, 79, 80, 81, 82, 84, 85,
-        86, 87, 88, 89, 90,
-    ]
-    coco_id_to_contiguous = {cid: idx for idx, cid in enumerate(coco_category_ids)}
-
     for image, target in batch:
         images.append(image)
-        
+
+        # If dataset already produced the normalized detection target dict,
+        # just forward it. (This is the preferred path for COCO/VOC transforms above.)
+        if isinstance(target, dict) and "boxes" in target and "labels" in target:
+            targets.append(target)
+            continue
+
         boxes = []
         labels = []
 
@@ -974,7 +1199,7 @@ def _collate_detection_batch(batch: list) -> Tuple["torch.Tensor", list]:  # typ
                     boxes.append([x, y, x + w, y + h])
                     # Convert COCO category_id to contiguous [0..79]
                     cat_id = ann.get("category_id", None)
-                    mapped = coco_id_to_contiguous.get(cat_id) if cat_id is not None else None
+                    mapped = COCO_ID_TO_CONTIGUOUS.get(int(cat_id)) if cat_id is not None else None
                     if mapped is None:
                         # Skip unknown/unsupported category IDs
                         boxes.pop()

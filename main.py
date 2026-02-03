@@ -54,13 +54,12 @@ def _start_evaluation(cm: ConfigManager) -> None:
         return
     
     checkpoint_path = eval_cfg.get("checkpoint_path")
-    if not checkpoint_path:
+    if checkpoint_path is None:
         checkpoint_path = config.checkpoint_path
     
-    if not checkpoint_path:
-        print("\n[error] No checkpoint path specified.")
-        print("Set evaluation.checkpoint_path or checkpoint_path in your config file.\n")
-        return
+    # checkpoint_path can be None for training from scratch
+    if checkpoint_path is None:
+        print("\n[info] No checkpoint path specified - training from scratch")
     
     head_type = eval_cfg.get("head_type", "classification")
     
@@ -81,6 +80,8 @@ def _start_evaluation(cm: ConfigManager) -> None:
             project_root=project_root,
             num_anchors=eval_cfg.get("num_anchors", 9),
             hidden_dim=eval_cfg.get("hidden_dim", 256),
+            use_bn=eval_cfg.get("use_bn", True),
+            dropout=eval_cfg.get("dropout", 0.1),
         )
         
         print("\nEvaluation results:")
