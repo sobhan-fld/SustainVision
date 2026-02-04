@@ -373,6 +373,7 @@ def build_classification_dataloaders(
             return (0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)
         if dataset == "mnist":
             return (0.1307, 0.1307, 0.1307), (0.3081, 0.3081, 0.3081)
+        # COCO and ImageNet use ImageNet normalization
         return (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
 
     mean, std = _norm(dataset_kind)
@@ -574,6 +575,119 @@ def build_classification_dataloaders(
             train_dataset = _wrap_contrastive(train_dataset, train_transform)
             val_dataset = _wrap_contrastive(val_dataset, train_transform)
 
+    elif dataset_kind == "coco":
+        # COCO as classification dataset: convert detection annotations to image-level labels
+        # Use the most common class in each image as the label
+        try:
+            from pycocotools.coco import COCO  # type: ignore
+        except ImportError:
+            raise DatasetPreparationError(
+                "pycocotools is required for COCO classification. Install with: pip install pycocotools"
+            )
+        
+        # Find COCO dataset - check both possible paths
+        coco_root = dataset_path
+        train_images = coco_root / "images" / "train2017"
+        if not train_images.exists():
+            train_images = coco_root / "train2017"
+        train_ann = coco_root / "annotations" / "instances_train2017.json"
+        
+        val_images = coco_root / "images" / "val2017"
+        if not val_images.exists():
+            val_images = coco_root / "val2017"
+        val_ann = coco_root / "annotations" / "instances_val2017.json"
+        
+        if not train_images.exists() or not train_ann.exists():
+            raise DatasetPreparationError(
+                f"COCO dataset not found. Expected train images at {train_images} and annotations at {train_ann}"
+            )
+        
+        # Create a classification dataset wrapper for COCO
+        class COCOClassificationDataset(torch.utils.data.Dataset):  # type: ignore[attr-defined]
+            def __init__(self, coco: COCO, image_dir: Path, transform=None):
+                self.coco = coco
+                self.image_dir = image_dir
+                self.transform = transform
+                self.ids = list(coco.imgs.keys())
+                # Pre-compute image-level labels (most common class per image)
+                self.labels = {}
+                print(f"[info] Computing image-level labels for {len(self.ids)} COCO images...")
+                for idx, img_id in enumerate(self.ids):
+                    if (idx + 1) % 10000 == 0:
+                        print(f"[info] Processed {idx + 1}/{len(self.ids)} images...")
+                    ann_ids = coco.getAnnIds(imgIds=img_id)
+                    anns = coco.loadAnns(ann_ids)
+                    if len(anns) > 0:
+                        # Count class occurrences
+                        class_counts = {}
+                        for ann in anns:
+                            cat_id = ann.get("category_id")
+                            if cat_id is not None:
+                                # Map COCO category_id to contiguous [0..79]
+                                mapped = COCO_ID_TO_CONTIGUOUS.get(int(cat_id))
+                                if mapped is not None:
+                                    class_counts[mapped] = class_counts.get(mapped, 0) + 1
+                        # Use most common class as label
+                        if class_counts:
+                            self.labels[img_id] = max(class_counts.items(), key=lambda x: x[1])[0]
+                        else:
+                            self.labels[img_id] = 0  # Default to class 0 if no valid annotations
+                    else:
+                        self.labels[img_id] = 0  # Default to class 0 if no annotations
+                
+                # Expose labels as targets attribute for M-per-class sampler
+                self.targets = [self.labels[img_id] for img_id in self.ids]
+                print(f"[info] Finished computing labels for {len(self.targets)} images")
+            
+            def __len__(self):
+                return len(self.ids)
+            
+            def __getitem__(self, idx):
+                img_id = self.ids[idx]
+                img_info = self.coco.imgs[img_id]
+                img_path = self.image_dir / img_info["file_name"]
+                
+                from PIL import Image
+                img = Image.open(img_path).convert("RGB")
+                
+                if self.transform:
+                    img = self.transform(img)
+                
+                label = self.labels[img_id]
+                return img, label
+        
+        train_transform = _base_transforms(train=True)
+        coco_train = COCO(str(train_ann))
+        train_dataset = COCOClassificationDataset(coco_train, train_images, transform=None if contrastive else train_transform)
+        num_classes = 80  # COCO has 80 classes
+        
+        if val_split > 0 or (val_images.exists() and val_ann.exists()):
+            if val_images.exists() and val_ann.exists():
+                coco_val = COCO(str(val_ann))
+                val_dataset = COCOClassificationDataset(
+                    coco_val, 
+                    val_images, 
+                    transform=None if contrastive else _base_transforms(train=False)
+                )
+            else:
+                # Split train set
+                total = len(train_dataset)
+                val_count = max(1, int(total * val_split))
+                train_count = total - val_count
+                indices = torch.randperm(total, generator=generator)
+                train_indices = indices[:train_count]
+                val_indices = indices[train_count:]
+                from torch.utils.data import Subset
+                val_dataset = Subset(train_dataset, val_indices.tolist())
+                train_dataset = Subset(train_dataset, train_indices.tolist())
+        else:
+            # No validation set, use train set
+            val_dataset = train_dataset
+        
+        if contrastive:
+            train_dataset = _wrap_contrastive(train_dataset, train_transform)
+            val_dataset = _wrap_contrastive(val_dataset, train_transform)
+    
     elif dataset_kind == "mnist":
         train_transform = _base_transforms(train=True)
         mnist_train_transform = None if contrastive else train_transform
@@ -719,6 +833,8 @@ def build_classification_dataloaders(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=contrastive,
+        prefetch_factor=2 if num_workers > 0 else None,  # Prefetch batches for faster GPU utilization
+        persistent_workers=num_workers > 0,  # Keep workers alive between epochs
     )
     val_loader = DataLoader(
         val_dataset,
@@ -726,6 +842,8 @@ def build_classification_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        prefetch_factor=2 if num_workers > 0 else None,
+        persistent_workers=num_workers > 0,
     )
 
     return train_loader, val_loader, num_classes
@@ -983,6 +1101,8 @@ def build_detection_dataloaders(
             num_workers=num_workers,
             pin_memory=True,
             collate_fn=_collate_detection_batch,
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -991,6 +1111,8 @@ def build_detection_dataloaders(
             num_workers=num_workers,
             pin_memory=True,
             collate_fn=_collate_detection_batch,
+            prefetch_factor=2 if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,
         )
 
         return train_loader, val_loader, num_classes
@@ -1150,6 +1272,8 @@ def build_detection_dataloaders(
         num_workers=num_workers,
         pin_memory=True,
         collate_fn=_collate_detection_batch,  # Custom collate for detection
+        prefetch_factor=2 if num_workers > 0 else None,  # Prefetch batches for faster GPU utilization
+        persistent_workers=num_workers > 0,  # Keep workers alive between epochs
     )
     val_loader = DataLoader(
         val_dataset,
@@ -1158,6 +1282,8 @@ def build_detection_dataloaders(
         num_workers=num_workers,
         pin_memory=True,
         collate_fn=_collate_detection_batch,
+        prefetch_factor=2 if num_workers > 0 else None,
+        persistent_workers=num_workers > 0,
     )
 
     return train_loader, val_loader, num_classes

@@ -22,6 +22,14 @@ except Exception:
     F = None  # type: ignore
     DataLoader = None  # type: ignore
 
+# Optional torchvision detection imports (for Faster R-CNN style replication)
+try:  # pragma: no cover - optional dependency
+    from torchvision.models.detection import FasterRCNN  # type: ignore[attr-defined]
+    from torchvision.models.detection.backbone_utils import resnet_fpn_backbone  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - runtime safeguard
+    FasterRCNN = None  # type: ignore
+    resnet_fpn_backbone = None  # type: ignore
+
 from .config import TrainingConfig
 from .models import build_model
 from .data import build_classification_dataloaders, build_detection_dataloaders, COCO_CONTIGUOUS_TO_ID
@@ -582,6 +590,77 @@ def _xyxy_to_xywh(boxes_xyxy: "torch.Tensor") -> "torch.Tensor":  # type: ignore
     return torch.stack([x1, y1, (x2 - x1), (y2 - y1)], dim=-1)
 
 
+def generate_coco_predictions_torchvision(
+    model: "torch.nn.Module",
+    dataloader: DataLoader,
+    *,
+    device: "torch.device",
+    score_threshold: float,
+    max_batches: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Generate COCO-format predictions from a torchvision detection model.
+
+    Assumes the model follows the standard torchvision detection API:
+      - model(images: List[Tensor]) -> List[Dict] in eval() mode.
+    Our dataloader yields (images: Tensor[B,3,H,W], targets: list[dict] with normalized boxes).
+    """
+    if torch is None:
+        raise RuntimeError("PyTorch is required")
+
+    model.eval()
+    preds: List[Dict[str, Any]] = []
+
+    with torch.no_grad():
+        for batch_idx, (images, targets) in enumerate(dataloader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+
+            # Convert batch tensor to list[Tensor]
+            images_list: List[torch.Tensor] = [img.to(device) for img in images]
+            outputs = model(images_list)  # type: ignore[call-arg]
+
+            if isinstance(outputs, dict):
+                # Safety: if we somehow got a loss dict, skip this batch
+                continue
+
+            for out, tgt, img in zip(outputs, targets, images):
+                boxes = out.get("boxes")
+                labels = out.get("labels")
+                scores = out.get("scores")
+                if boxes is None or labels is None or scores is None:
+                    continue
+
+                keep = scores >= float(score_threshold)
+                boxes = boxes[keep]
+                labels = labels[keep]
+                scores = scores[keep]
+                if boxes.numel() == 0:
+                    continue
+
+                # COCO expects xywh
+                boxes_xywh = _xyxy_to_xywh(boxes.detach().cpu())
+                # Retrieve image id from target if available
+                image_id = int(tgt.get("image_id", -1)) if isinstance(tgt, dict) else -1
+
+                for b, s, l in zip(boxes_xywh, scores, labels):
+                    # torchvision Faster R-CNN outputs COCO category IDs directly (1-indexed: 1-80)
+                    # NOT our contiguous 0-indexed labels, so use them as-is
+                    coco_cat = int(l.item())
+                    # COCO category IDs are 1-80, skip if out of range
+                    if coco_cat < 1 or coco_cat > 80:
+                        continue
+                    preds.append(
+                        {
+                            "image_id": image_id,
+                            "category_id": coco_cat,
+                            "bbox": [float(x) for x in b.tolist()],
+                            "score": float(s.item()),
+                        }
+                    )
+
+    return preds
+
+
 def generate_coco_predictions(
     model: MultiHeadModel,
     dataloader: DataLoader,
@@ -743,6 +822,15 @@ def evaluate_with_head(
     """
     if torch is None or DataLoader is None:
         raise RuntimeError("PyTorch is required for evaluation")
+
+    # Special-case: use torchvision's Faster R-CNN style detector with ResNet18+FPN.
+    if head_type == "torchvision_frcnn":
+        return _evaluate_torchvision_frcnn(
+            config=config,
+            checkpoint_path=checkpoint_path,
+            project_root=project_root,
+            report_path=report_path,
+        )
     
     device_str = config.device
     if device_str.startswith("cuda") and not torch.cuda.is_available():
@@ -904,6 +992,439 @@ def evaluate_with_head(
         return _evaluate_detection(model, train_loader, val_loader, device, config)
     else:
         raise ValueError(f"Unsupported head_type: {head_type}")
+
+
+def _evaluate_torchvision_frcnn(
+    config: TrainingConfig,
+    *,
+    checkpoint_path: Optional[Union[str, Path]] = None,
+    project_root: Optional[Path] = None,
+    report_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """Train/evaluate a torchvision Faster R-CNN style detector with ResNet-18+FPN on COCO.
+
+    This uses torchvision's detection model plus SustainVision's dataloaders,
+    reporting, and CodeCarbon integration so we can compare emissions and accuracy
+    against our custom detection head under as similar settings as possible.
+    """
+    if (
+        torch is None
+        or DataLoader is None
+        or FasterRCNN is None
+        or resnet_fpn_backbone is None
+    ):
+        raise RuntimeError(
+            "PyTorch + torchvision detection are required for head_type='torchvision_frcnn'. "
+            "Install torchvision with detection modules."
+        )
+
+    from .data import build_detection_dataloaders
+    from .optimizers import build_optimizer, build_scheduler
+    from .reporting import write_report_csv
+    from .utils import resolve_device
+
+    device = resolve_device(config.device)
+
+    root = Path(project_root or Path.cwd())
+    save_dir = root / Path(config.save_model_path or "output_object_detection")
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    if report_path is None:
+        report_path = root / Path(
+            config.report_filename
+            or (save_dir / "torchvision_frcnn_resnet18_metrics.csv")
+        )
+
+    # Build detection dataloaders (COCO / VOC) using existing utilities.
+    print(f"[info] Building dataloaders for dataset: {config.database}")
+    eval_cfg = getattr(config, "evaluation", {}) or {}
+    filter_classes = None
+    if eval_cfg.get("filter_coco_to_cifar100", False):
+        from .data import get_coco_classes_for_cifar100
+
+        filter_classes = get_coco_classes_for_cifar100()
+
+    train_loader, val_loader, dataset_num_classes = build_detection_dataloaders(
+        config.database,
+        batch_size=config.hyperparameters.get("batch_size", 2),
+        num_workers=config.hyperparameters.get("num_workers", 2),
+        val_split=config.hyperparameters.get("val_split", 0.0),
+        seed=config.seed,
+        project_root=project_root,
+        image_size=config.hyperparameters.get("image_size", 800),
+        max_train_images=config.hyperparameters.get("max_train_images"),
+        max_val_images=config.hyperparameters.get("max_val_images"),
+        filter_classes=filter_classes,
+    )
+
+    num_classes = dataset_num_classes  # contiguous [0..C-1]
+    num_classes_with_bg = num_classes + 1  # torchvision detectors include background
+
+    print("[info] Building torchvision Faster R-CNN (ResNet-18 + FPN) detector")
+    backbone = resnet_fpn_backbone("resnet18", pretrained=False, trainable_layers=5)  # type: ignore[call-arg]
+    model = FasterRCNN(backbone, num_classes=num_classes_with_bg)  # type: ignore[call-arg]
+
+    # TODO: Map SupCon ResNet18 weights into backbone.body.* when checkpoint_path is provided.
+    if checkpoint_path is not None:
+        print(
+            "[warn] Loading SupCon/contrastive checkpoints into torchvision_frcnn "
+            "is not implemented yet; training detector from scratch."
+        )
+
+    model.to(device)
+
+    base_lr = float(
+        config.hyperparameters.get(
+            "backbone_lr", config.hyperparameters.get("lr", 0.01)
+        )
+    )
+    optimizer = build_optimizer(
+        config.optimizer,
+        model.parameters(),
+        lr=base_lr,
+        momentum=config.hyperparameters.get("momentum", 0.9),
+        weight_decay=config.weight_decay,
+    )
+
+    scheduler_config = getattr(config, "scheduler", None)
+    scheduler = build_scheduler(scheduler_config, optimizer) if scheduler_config else None
+
+    epochs = int(config.hyperparameters.get("epochs", 12))
+    max_train_batches = config.hyperparameters.get("max_train_batches")
+    max_val_batches = config.hyperparameters.get("max_val_batches")
+    gradient_clip_norm = config.hyperparameters.get("gradient_clip_norm")
+    score_threshold = float(config.hyperparameters.get("score_threshold", 0.05))
+
+    try:
+        max_train_batches = int(max_train_batches) if max_train_batches is not None else None
+    except Exception:
+        max_train_batches = None
+    try:
+        max_val_batches = int(max_val_batches) if max_val_batches is not None else None
+    except Exception:
+        max_val_batches = None
+
+    track_emissions = bool(config.hyperparameters.get("track_emissions", True))
+    emissions_kg_total: Optional[float] = None
+    energy_kwh_total: Optional[float] = None
+    duration_seconds: Optional[float] = None
+    start_time = time.perf_counter()
+    block_tracker: Any = None
+
+    def _start_block_tracker() -> Any:
+        if not track_emissions or EmissionsTracker is None:
+            return None
+        import logging
+
+        logging.getLogger("codecarbon").setLevel(logging.WARNING)
+        local_tracker = EmissionsTracker(
+            measure_power_secs=5,
+            project_name=report_path.stem,
+            log_level="warning",
+            save_to_file=False,
+        )  # type: ignore[call-arg]
+        local_tracker.start()
+        return local_tracker
+
+    def _stop_block_tracker(current_epoch: int) -> None:
+        nonlocal block_tracker, emissions_kg_total, energy_kwh_total
+        if block_tracker is None:
+            return
+        try:
+            block_kg = block_tracker.stop()
+            block_data = getattr(block_tracker, "final_emissions_data", None)
+        except Exception:
+            block_kg = None
+            block_data = None
+        block_tracker = None
+
+        if block_kg is not None:
+            emissions_kg_total = (emissions_kg_total or 0.0) + float(block_kg)
+        if block_data is not None:
+            try:
+                block_energy = getattr(block_data, "energy_consumed", None)
+                if block_energy is not None:
+                    energy_kwh_total = (energy_kwh_total or 0.0) + float(block_energy)
+            except Exception:
+                pass
+
+        try:
+            _log_resource_and_energy_snapshot(
+                artifact_dir=save_dir,
+                epoch=current_epoch,
+                emissions_data=block_data,
+                elapsed_seconds=time.perf_counter() - start_time,
+                device=device,
+            )
+        except Exception as exc:  # pragma: no cover - best-effort logging
+            print(
+                f"[warn] Failed to record resource/energy snapshot at epoch {current_epoch}: {exc}"
+            )
+
+    metrics_rows: List[Dict[str, Any]] = []
+    best_val_loss = float("inf")
+    best_epoch = -1
+    save_model = bool(config.save_model)
+    checkpoint_interval = int(config.hyperparameters.get("checkpoint_interval", 50))
+
+    try:
+        for epoch in range(epochs):
+            if track_emissions and (epoch % 10 == 0) and block_tracker is None:
+                block_tracker = _start_block_tracker()
+
+            # --------------------
+            # Training
+            # --------------------
+            model.train()
+            train_loss = 0.0
+            train_samples = 0
+
+            try:
+                from tqdm.auto import tqdm
+
+                train_iter = tqdm(
+                    train_loader,
+                    desc=f"Train (FRCNN) {epoch+1}/{epochs}",
+                    leave=False,
+                    unit="batch",
+                )
+            except Exception:
+                train_iter = train_loader
+
+            for batch_idx, (images, targets) in enumerate(train_iter):
+                if max_train_batches is not None and batch_idx >= max_train_batches:
+                    break
+
+                images_list = [img.to(device) for img in images]
+                converted_targets: List[Dict[str, Any]] = []
+                for i, t in enumerate(targets):
+                    if not isinstance(t, dict) or "boxes" not in t or "labels" not in t:
+                        continue
+                    boxes_norm = t["boxes"]
+                    labels = t["labels"]
+                    h = images[i].shape[1]
+                    w = images[i].shape[2]
+                    boxes_abs = boxes_norm.clone()
+                    boxes_abs[:, 0] *= w
+                    boxes_abs[:, 2] *= w
+                    boxes_abs[:, 1] *= h
+                    boxes_abs[:, 3] *= h
+                    converted_targets.append(
+                        {
+                            "boxes": boxes_abs.to(device),
+                            "labels": labels.to(device),
+                        }
+                    )
+
+                if not converted_targets:
+                    continue
+
+                optimizer.zero_grad()
+                loss_dict = model(images_list, converted_targets)  # type: ignore[call-arg]
+                loss = sum(loss for loss in loss_dict.values())
+                loss.backward()
+                if gradient_clip_norm is not None and gradient_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+                optimizer.step()
+
+                batch_size = len(images_list)
+                train_loss += loss.item() * batch_size
+                train_samples += batch_size
+
+            avg_train_loss = train_loss / max(train_samples, 1)
+
+            if scheduler is not None:
+                scheduler.step()
+
+            # --------------------
+            # Validation
+            # --------------------
+            model.eval()
+            val_loss = 0.0
+            val_samples = 0
+
+            try:
+                from tqdm.auto import tqdm
+
+                val_iter = tqdm(
+                    val_loader,
+                    desc=f"Val (FRCNN) {epoch+1}/{epochs}",
+                    leave=False,
+                    unit="batch",
+                )
+            except Exception:
+                val_iter = val_loader
+
+            with torch.no_grad():
+                for batch_idx, (images, targets) in enumerate(val_iter):
+                    if max_val_batches is not None and batch_idx >= max_val_batches:
+                        break
+
+                    images_list = [img.to(device) for img in images]
+                    converted_targets: List[Dict[str, Any]] = []
+                    for i, t in enumerate(targets):
+                        if not isinstance(t, dict) or "boxes" not in t or "labels" not in t:
+                            continue
+                        boxes_norm = t["boxes"]
+                        labels = t["labels"]
+                        h = images[i].shape[1]
+                        w = images[i].shape[2]
+                        boxes_abs = boxes_norm.clone()
+                        boxes_abs[:, 0] *= w
+                        boxes_abs[:, 2] *= w
+                        boxes_abs[:, 1] *= h
+                        boxes_abs[:, 3] *= h
+                        converted_targets.append(
+                            {
+                                "boxes": boxes_abs.to(device),
+                                "labels": labels.to(device),
+                            }
+                        )
+
+                    if not converted_targets:
+                        continue
+
+                    # Faster R-CNN returns loss dict in train mode, predictions in eval mode
+                    # Temporarily switch to train mode to compute validation loss
+                    model.train()
+                    loss_dict = model(images_list, converted_targets)  # type: ignore[call-arg]
+                    model.eval()  # Switch back to eval mode
+                    
+                    if isinstance(loss_dict, dict):
+                        loss = sum(loss for loss in loss_dict.values())
+                    else:
+                        # Fallback: if somehow we get predictions, skip this batch
+                        print(f"[warn] Unexpected loss_dict type in validation: {type(loss_dict)}")
+                        continue
+
+                    batch_size = len(images_list)
+                    val_loss += loss.item() * batch_size
+                    val_samples += batch_size
+
+            avg_val_loss = val_loss / max(val_samples, 1)
+
+            print(
+                f"Epoch {epoch+1}/{epochs} (FRCNN) - "
+                f"train_loss={avg_train_loss:.4f} val_loss={avg_val_loss:.4f}"
+            )
+
+            metrics_rows.append(
+                {
+                    "epoch": epoch + 1,
+                    "train_loss": avg_train_loss,
+                    "val_loss": avg_val_loss,
+                }
+            )
+
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                best_epoch = epoch + 1
+
+            if save_model and (
+                (epoch + 1) % checkpoint_interval == 0 or (epoch + 1) == epochs
+            ):
+                ckpt_path = save_dir / f"torchvision_frcnn_resnet18_epoch{epoch+1}.pt"
+                try:
+                    torch.save(model.state_dict(), ckpt_path)
+                    print(f"[info] Saved detector checkpoint to {ckpt_path}")
+                except Exception as exc:
+                    print(f"[warn] Failed to save checkpoint to {ckpt_path}: {exc}")
+
+            if track_emissions and ((epoch + 1) % 10 == 0) and block_tracker is not None:
+                _stop_block_tracker(epoch + 1)
+
+        duration_seconds = time.perf_counter() - start_time
+
+        if block_tracker is not None:
+            _stop_block_tracker(epochs)
+
+    finally:
+        if block_tracker is not None:
+            try:
+                block_tracker.stop()
+            except Exception:
+                pass
+
+    # COCO mAP via pycocotools
+    coco_metrics: Dict[str, Any] = {}
+    coco_gt = _get_coco_api_from_dataset(getattr(val_loader, "dataset", None))
+    if coco_gt is not None:
+        try:
+            coco_predictions = generate_coco_predictions_torchvision(
+                model,
+                val_loader,
+                device=device,
+                score_threshold=score_threshold,
+                max_batches=max_val_batches,
+            )
+            eval_cfg_local = getattr(config, "evaluation", {}) or {}
+            save_predictions_flag = bool(eval_cfg_local.get("save_predictions", False))
+            predictions_path = eval_cfg_local.get("predictions_path")
+            if save_predictions_flag:
+                import json
+
+                if isinstance(predictions_path, str) and predictions_path.strip():
+                    out_path = Path(predictions_path.strip())
+                    if not out_path.is_absolute():
+                        out_path = (Path.cwd() / out_path).resolve()
+                else:
+                    out_path = save_dir / "coco_predictions_torchvision.json"
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                with out_path.open("w", encoding="utf-8") as f:
+                    json.dump(coco_predictions, f)
+                coco_metrics["predictions_json"] = str(out_path)
+
+            map_iou_thresholds = eval_cfg_local.get("map_iou_thresholds")
+            if isinstance(map_iou_thresholds, (list, tuple)):
+                map_iou_thresholds = [float(x) for x in map_iou_thresholds]
+            else:
+                map_iou_thresholds = None
+            coco_metrics = compute_coco_map(
+                coco_gt, coco_predictions, iou_thresholds=map_iou_thresholds
+            )
+        except Exception as exc:
+            coco_metrics = {"note": f"COCO mAP computation failed: {exc}"}
+
+    # Write CSV report (without extra_summary - that parameter doesn't exist)
+    try:
+        write_report_csv(
+            report_path,
+            metrics_rows,
+            config=config,
+            emissions_kg=emissions_kg_total,
+            energy_kwh=energy_kwh_total,
+            duration_seconds=duration_seconds,
+        )
+        # Append mAP summary to CSV manually if we have coco_metrics
+        if coco_metrics and "map" in coco_metrics:
+            try:
+                import csv
+                report_path.parent.mkdir(parents=True, exist_ok=True)
+                with report_path.open("a", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=["map", "map50", "map75", "predictions_json"])
+                    if f.tell() == 0:  # File is empty, write header
+                        writer.writeheader()
+                    writer.writerow({
+                        "map": coco_metrics.get("map", ""),
+                        "map50": coco_metrics.get("map50", ""),
+                        "map75": coco_metrics.get("map75", ""),
+                        "predictions_json": coco_metrics.get("predictions_json", ""),
+                    })
+            except Exception as exc2:
+                print(f"[warn] Failed to append mAP summary to CSV: {exc2}")
+    except Exception as exc:
+        print(f"[warn] Failed to write detection CSV report to {report_path}: {exc}")
+
+    results = {
+        "head_type": "torchvision_frcnn",
+        "best_val_loss": best_val_loss,
+        "best_epoch": best_epoch,
+        "emissions_kg": emissions_kg_total,
+        "energy_kwh": energy_kwh_total,
+        "duration_seconds": duration_seconds,
+    }
+    results.update(coco_metrics)
+    return results
 
 
 def _evaluate_classification(
@@ -1254,7 +1775,19 @@ def _evaluate_detection(
             train_bbox_loss = 0.0
             train_samples = 0
             
-            for batch_idx, (images, targets) in enumerate(train_loader):
+            # Use tqdm for progress bar
+            try:
+                from tqdm.auto import tqdm
+                train_iterable = tqdm(
+                    train_loader,
+                    desc=f"Train {epoch+1}/{epochs}",
+                    leave=False,
+                    unit="batch",
+                )
+            except ImportError:
+                train_iterable = train_loader
+            
+            for batch_idx, (images, targets) in enumerate(train_iterable):
                 if max_train_batches is not None and batch_idx >= max_train_batches:
                     break
                 images = images.to(device)
@@ -1341,8 +1874,8 @@ def _evaluate_detection(
                     train_bbox_loss += (total_bbox_loss / valid_samples).item()
                     train_samples += valid_samples
 
-                if log_every > 0 and (batch_idx + 1) % log_every == 0:
-                    print(f"[info] epoch {epoch+1}/{epochs} - train batch {batch_idx+1}")
+                # Progress is now shown via tqdm, so we can remove or reduce logging frequency
+                # Keep log_every for backward compatibility but tqdm shows progress automatically
             
             avg_train_loss = train_loss / len(train_loader) if len(train_loader) > 0 else 0.0
             avg_train_cls_loss = train_cls_loss / len(train_loader) if len(train_loader) > 0 else 0.0
@@ -1357,8 +1890,20 @@ def _evaluate_detection(
             total_gt_objects = 0
             matched_gt_objects = 0
             
+            # Use tqdm for validation progress bar
+            try:
+                from tqdm.auto import tqdm
+                val_iterable = tqdm(
+                    val_loader,
+                    desc=f"Val {epoch+1}/{epochs}",
+                    leave=False,
+                    unit="batch",
+                )
+            except ImportError:
+                val_iterable = val_loader
+            
             with torch.no_grad():
-                for batch_idx, (images, targets) in enumerate(val_loader):
+                for batch_idx, (images, targets) in enumerate(val_iterable):
                     if max_val_batches is not None and batch_idx >= max_val_batches:
                         break
                     images = images.to(device)

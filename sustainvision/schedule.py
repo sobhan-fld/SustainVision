@@ -7,6 +7,7 @@ for contrastive learning (SimCLR, SupCon, etc.).
 from __future__ import annotations
 
 import logging
+import tempfile
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -38,6 +39,7 @@ def _parse_schedule_config(config: TrainingConfig) -> Dict[str, Any]:
         "finetune_epochs": int(schedule_cfg.get("finetune_epochs", 20)),
         "pretrain_loss": str(schedule_cfg.get("pretrain_loss", "simclr")),
         "finetune_loss": str(schedule_cfg.get("finetune_loss", "cross_entropy")),
+        "finetune_head_type": str(schedule_cfg.get("finetune_head_type", "classification")),  # "classification" or "detection"
         "finetune_lr": float(finetune_lr) if finetune_lr is not None else base_lr,
         "finetune_optimizer": schedule_cfg.get("finetune_optimizer"),
         "finetune_weight_decay": (
@@ -130,34 +132,138 @@ def _run_finetune_phase(
 ) -> Tuple[TrainingRunSummary, dict]:
     """Run a single finetune phase (supervised learning).
     
-    This phase evaluates the backbone quality by training a fresh linear head
-    with frozen backbone. After this phase, the backbone will be unfrozen again
-    in the next pretrain phase to continue improving.
+    This phase evaluates the backbone quality by training a fresh head
+    (classification or detection) with frozen backbone. After this phase, 
+    the backbone will be unfrozen again in the next pretrain phase to continue improving.
     """
     finetune_label = f"finetune_cycle_{cycle}"
-    print(f"[info] Starting finetune phase: {finetune_label} (backbone frozen, evaluating representation quality)")
+    finetune_head_type = params.get("finetune_head_type", "classification")
     
-    summary, state = _execute_training_phase(
-        config,
-        project_root=project_dir,
-        report_path=report_path,
-        phase_label=finetune_label,
-        initial_state=model_state,
-        write_outputs=False,
-        loss_function_override=params["finetune_loss"],
-        epochs_override=params["finetune_epochs"],
-        lr_override=params["finetune_lr"],
-        optimizer_override=params.get("finetune_optimizer"),
-        weight_decay_override=params.get("finetune_weight_decay"),
-        freeze_backbone_override=params["freeze_backbone"],
-        skip_emissions_tracker=False,
-        reset_classifier=params["freeze_backbone"],  # Reset classifier to evaluate backbone quality
-        scheduler_config_override=None,
-        simclr_recipe_override=params["use_reference_transforms"],
-        subset_per_class_override=params.get("linear_subset_per_class"),
-        subset_seed_override=params.get("linear_subset_seed"),
-    )
-    return summary, state
+    if finetune_head_type == "detection":
+        # Use detection head for finetune phase
+        print(f"[info] Starting finetune phase: {finetune_label} (backbone frozen, detection head)")
+        
+        # Import evaluation module
+        from .evaluation import evaluate_with_head
+        
+        # Create a temporary checkpoint path for the current model state
+        import tempfile
+        import torch
+        if torch is None:
+            raise RuntimeError("PyTorch is required for detection finetune")
+        
+        # Save model state to temporary checkpoint
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as tmp_file:
+            tmp_checkpoint = Path(tmp_file.name)
+            torch.save({"model_state": model_state}, tmp_checkpoint)
+        
+        try:
+            # Get evaluation config from main config
+            eval_cfg = getattr(config, "evaluation", {}) or {}
+            
+            # Build head kwargs from config
+            head_kwargs = {
+                "num_anchors": eval_cfg.get("num_anchors", 100),
+                "hidden_dim": eval_cfg.get("hidden_dim", 512),
+                "use_bn": eval_cfg.get("use_bn", True),
+                "dropout": eval_cfg.get("dropout", 0.1),
+            }
+            
+            # Override epochs for finetune phase
+            original_epochs = config.hyperparameters.get("epochs")
+            config.hyperparameters["epochs"] = params["finetune_epochs"]
+            
+            # Override learning rate if specified
+            if params.get("finetune_lr") is not None:
+                config.hyperparameters["lr"] = params["finetune_lr"]
+            
+            # Override optimizer if specified
+            if params.get("finetune_optimizer") is not None:
+                config.optimizer = params["finetune_optimizer"]
+            
+            # Override weight decay if specified
+            if params.get("finetune_weight_decay") is not None:
+                config.weight_decay = params["finetune_weight_decay"]
+            
+            # Set freeze_backbone in evaluation config
+            eval_cfg["freeze_backbone"] = params["freeze_backbone"]
+            config.evaluation = eval_cfg
+            
+            # Run detection evaluation
+            result = evaluate_with_head(
+                config,
+                checkpoint_path=tmp_checkpoint,
+                head_type="detection",
+                project_root=project_dir,
+                report_path=report_path,
+                **head_kwargs,
+            )
+            
+            # Restore original epochs
+            if original_epochs is not None:
+                config.hyperparameters["epochs"] = original_epochs
+            
+            # Extract model state from the evaluation result
+            # The model state should be saved in the checkpoint directory
+            save_model_path = getattr(config, "save_model_path", None) or "outputs"
+            save_dir = Path(save_model_path)
+            # Find the latest checkpoint
+            checkpoint_files = list(save_dir.glob("epoch_*.pt"))
+            if checkpoint_files:
+                latest_checkpoint = max(checkpoint_files, key=lambda p: p.stat().st_mtime)
+                checkpoint = torch.load(latest_checkpoint, map_location="cpu")
+                model_state = checkpoint.get("model_state")
+            else:
+                # Fallback: model state might not have changed
+                model_state = model_state
+            
+            # Create a summary from the result
+            from .types import TrainingRunSummary
+            summary = TrainingRunSummary(
+                report_path=report_path,
+                emissions_kg=result.get("emissions_kg"),
+                energy_kwh=result.get("energy_kwh"),
+                duration_seconds=result.get("duration_seconds"),
+                quantized_model_path=None,
+            )
+            
+            state = {
+                "model_state": model_state,
+                "optimizer_state": {},  # Detection evaluation manages its own optimizer
+            }
+            
+        finally:
+            # Clean up temporary checkpoint
+            if tmp_checkpoint.exists():
+                tmp_checkpoint.unlink()
+        
+        return summary, state
+    
+    else:
+        # Use classification head (original behavior)
+        print(f"[info] Starting finetune phase: {finetune_label} (backbone frozen, classification head)")
+        
+        summary, state = _execute_training_phase(
+            config,
+            project_root=project_dir,
+            report_path=report_path,
+            phase_label=finetune_label,
+            initial_state=model_state,
+            write_outputs=False,
+            loss_function_override=params["finetune_loss"],
+            epochs_override=params["finetune_epochs"],
+            lr_override=params["finetune_lr"],
+            optimizer_override=params.get("finetune_optimizer"),
+            weight_decay_override=params.get("finetune_weight_decay"),
+            freeze_backbone_override=params["freeze_backbone"],
+            skip_emissions_tracker=False,
+            reset_classifier=params["freeze_backbone"],  # Reset classifier to evaluate backbone quality
+            scheduler_config_override=None,
+            simclr_recipe_override=params["use_reference_transforms"],
+            subset_per_class_override=params.get("linear_subset_per_class"),
+            subset_seed_override=params.get("linear_subset_seed"),
+        )
+        return summary, state
 
 
 def _save_cycle_checkpoint(
