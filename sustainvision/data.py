@@ -683,11 +683,11 @@ def build_classification_dataloaders(
         else:
             # No validation set, use train set
             val_dataset = train_dataset
-        
+
         if contrastive:
             train_dataset = _wrap_contrastive(train_dataset, train_transform)
             val_dataset = _wrap_contrastive(val_dataset, train_transform)
-    
+
     elif dataset_kind == "mnist":
         train_transform = _base_transforms(train=True)
         mnist_train_transform = None if contrastive else train_transform
@@ -861,6 +861,7 @@ def build_detection_dataloaders(
     max_train_images: Optional[int] = None,
     max_val_images: Optional[int] = None,
     filter_classes: Optional[set[int]] = None,  # Set of COCO class indices [0..79] to keep
+    normalize_images: bool = True,
 ) -> Tuple["DataLoader", "DataLoader", int]:  # type: ignore[name-defined]
     """Build dataloaders for object detection datasets (COCO, Pascal VOC, tiny synthetic).
     
@@ -921,7 +922,12 @@ def build_detection_dataloaders(
 
         img = TF.resize(img, [image_size, image_size])
         tensor = TF.to_tensor(img)
-        tensor = TF.normalize(tensor, mean=mean, std=std)
+        # NOTE: torchvision detection models (Faster R-CNN / RetinaNet / etc.)
+        # apply their own normalization inside GeneralizedRCNNTransform.
+        # If we normalize here as well, images get double-normalized, which can
+        # lead to degenerate predictions (often empty).
+        if normalize_images:
+            tensor = TF.normalize(tensor, mean=mean, std=std)
         return tensor
 
     # Create class remapping if filtering is enabled
@@ -1045,7 +1051,7 @@ def build_detection_dataloaders(
             torch.zeros((0, 4), dtype=torch.float32),
             torch.zeros((0,), dtype=torch.long),
             image_id,
-        )
+    )
 
     # ------------------------------------------------------------------
     # Tiny synthetic detection dataset for quickly testing the pipeline
@@ -1305,7 +1311,7 @@ def _collate_detection_batch(batch: list) -> Tuple["torch.Tensor", list]:  # typ
 
     for image, target in batch:
         images.append(image)
-
+        
         # If dataset already produced the normalized detection target dict,
         # just forward it. (This is the preferred path for COCO/VOC transforms above.)
         if isinstance(target, dict) and "boxes" in target and "labels" in target:

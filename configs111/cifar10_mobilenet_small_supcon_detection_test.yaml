@@ -1,0 +1,36 @@
+# Test config for evaluating MobileNet Small SupCon (M-per-class) with object detection head
+# Original model: outputs_old2/mobilenet_small_supcon_mperclass_cifar10_v3
+
+model: mobilenet_v3_small
+database: databases/cifar10
+device: cuda:0  # Adjust based on available GPU
+seed: 42
+
+# Evaluation configuration - enable detection head evaluation
+evaluation:
+  enabled: true
+  checkpoint_path: outputs_old2/mobilenet_small_supcon_mperclass_cifar10_v3/mobilenet_small_supcon_mperclass_cifar10_v3_cycle10.pt
+  head_type: detection  # Object detection head
+  num_anchors: 9  # 3 scales × 3 aspect ratios
+  hidden_dim: 256  # Hidden dimension for detection head
+
+# Hyperparameters for training the detection head (backbone stays frozen)
+hyperparameters:
+  batch_size: 256
+  lr: 0.01  # Learning rate for training the detection head
+  epochs: 20  # Number of epochs to train the head
+  momentum: 0.9
+  num_workers: 12
+  val_split: 0.0  # Use test set if available
+  image_size: 32  # CIFAR-10 image size
+  projection_dim: 128  # Must match original training config
+  projection_hidden_dim: 2048  # Must match original training config
+  projection_use_bn: true  # Must match original training config
+
+# These are not used during evaluation but kept for compatibility
+optimizer: sgd
+loss_function: cross_entropy
+weight_decay: 0.0001
+save_model: false
+freeze_backbone: true  # Always true during evaluation
+

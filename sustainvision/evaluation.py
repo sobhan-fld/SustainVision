@@ -610,53 +610,92 @@ def generate_coco_predictions_torchvision(
     model.eval()
     preds: List[Dict[str, Any]] = []
 
-    with torch.no_grad():
-        for batch_idx, (images, targets) in enumerate(dataloader):
-            if max_batches is not None and batch_idx >= max_batches:
-                break
+    # Torchvision Faster R-CNN filters detections inside the model using
+    # `model.roi_heads.score_thresh` (default ~0.05). If we want to evaluate with a
+    # lower threshold (e.g. 0.001), we must override it during inference.
+    old_model_thresh: Optional[float] = None
+    try:
+        if hasattr(model, "roi_heads") and hasattr(model.roi_heads, "score_thresh"):
+            old_model_thresh = float(model.roi_heads.score_thresh)
+            model.roi_heads.score_thresh = float(score_threshold)
+    except Exception:
+        old_model_thresh = None
 
-            # Convert batch tensor to list[Tensor]
-            images_list: List[torch.Tensor] = [img.to(device) for img in images]
-            outputs = model(images_list)  # type: ignore[call-arg]
+    try:
+        with torch.no_grad():
+            for batch_idx, (images, targets) in enumerate(dataloader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
 
-            if isinstance(outputs, dict):
-                # Safety: if we somehow got a loss dict, skip this batch
-                continue
+                # Convert batch tensor to list[Tensor]
+                images_list: List[torch.Tensor] = [img.to(device) for img in images]
+                outputs = model(images_list)  # type: ignore[call-arg]
 
-            for out, tgt, img in zip(outputs, targets, images):
-                boxes = out.get("boxes")
-                labels = out.get("labels")
-                scores = out.get("scores")
-                if boxes is None or labels is None or scores is None:
+                if isinstance(outputs, dict):
+                    # Safety: if we somehow got a loss dict, skip this batch
                     continue
 
-                keep = scores >= float(score_threshold)
-                boxes = boxes[keep]
-                labels = labels[keep]
-                scores = scores[keep]
-                if boxes.numel() == 0:
-                    continue
-
-                # COCO expects xywh
-                boxes_xywh = _xyxy_to_xywh(boxes.detach().cpu())
-                # Retrieve image id from target if available
-                image_id = int(tgt.get("image_id", -1)) if isinstance(tgt, dict) else -1
-
-                for b, s, l in zip(boxes_xywh, scores, labels):
-                    # torchvision Faster R-CNN outputs COCO category IDs directly (1-indexed: 1-80)
-                    # NOT our contiguous 0-indexed labels, so use them as-is
-                    coco_cat = int(l.item())
-                    # COCO category IDs are 1-80, skip if out of range
-                    if coco_cat < 1 or coco_cat > 80:
+                for out, tgt, img in zip(outputs, targets, images):
+                    boxes = out.get("boxes")
+                    labels = out.get("labels")
+                    scores = out.get("scores")
+                    if boxes is None or labels is None or scores is None:
                         continue
-                    preds.append(
-                        {
-                            "image_id": image_id,
-                            "category_id": coco_cat,
-                            "bbox": [float(x) for x in b.tolist()],
-                            "score": float(s.item()),
-                        }
-                    )
+
+                    # If the model returns no detections for an image, skip it.
+                    if boxes.numel() == 0:
+                        continue
+
+                    # Get image_id / original size from target dict (set by our dataloader transforms)
+                    image_id = int(tgt.get("image_id", -1)) if isinstance(tgt, dict) else -1
+                    if image_id == -1:
+                        continue
+
+                    orig_size = tgt.get("orig_size", None) if isinstance(tgt, dict) else None
+                    in_h = int(img.shape[1])
+                    in_w = int(img.shape[2])
+
+                    # Scale boxes from our input image size (e.g. 224x224) back to original COCO size,
+                    # because COCOeval expects boxes in original pixel coordinates.
+                    boxes_scaled = boxes
+                    if orig_size is not None:
+                        try:
+                            orig_h = int(orig_size[0])
+                            orig_w = int(orig_size[1])
+                            if in_h > 0 and in_w > 0:
+                                scale = boxes.new_tensor(
+                                    [orig_w / in_w, orig_h / in_h, orig_w / in_w, orig_h / in_h]
+                                )
+                                boxes_scaled = boxes * scale
+                        except Exception:
+                            boxes_scaled = boxes
+
+                    # COCO expects xywh
+                    boxes_xywh = _xyxy_to_xywh(boxes_scaled.detach().cpu())
+
+                    # torchvision Faster R-CNN outputs class indices in [1..num_classes-1]
+                    # (0 is background). Our dataset uses contiguous [0..79], so:
+                    # contiguous = label - 1, then map to official COCO category_id.
+                    for b, s, l in zip(boxes_xywh, scores, labels):
+                        contiguous = int(l.item()) - 1
+                        coco_cat = COCO_CONTIGUOUS_TO_ID.get(contiguous)
+                        if coco_cat is None:
+                            continue
+                        preds.append(
+                            {
+                                "image_id": image_id,
+                                "category_id": int(coco_cat),
+                                "bbox": [float(x) for x in b.tolist()],
+                                "score": float(s.item()),
+                            }
+                        )
+    finally:
+        # Restore model's original threshold
+        try:
+            if old_model_thresh is not None and hasattr(model, "roi_heads") and hasattr(model.roi_heads, "score_thresh"):
+                model.roi_heads.score_thresh = old_model_thresh
+        except Exception:
+            pass
 
     return preds
 
@@ -1055,6 +1094,8 @@ def _evaluate_torchvision_frcnn(
         max_train_images=config.hyperparameters.get("max_train_images"),
         max_val_images=config.hyperparameters.get("max_val_images"),
         filter_classes=filter_classes,
+        # Important: torchvision Faster R-CNN normalizes internally.
+        normalize_images=False,
     )
 
     num_classes = dataset_num_classes  # contiguous [0..C-1]
@@ -1212,7 +1253,9 @@ def _evaluate_torchvision_frcnn(
                     converted_targets.append(
                         {
                             "boxes": boxes_abs.to(device),
-                            "labels": labels.to(device),
+                            # Torchvision detectors use labels in [1..num_classes-1] (0 = background).
+                            # Our COCO dataloader yields contiguous labels in [0..79], so shift by +1.
+                            "labels": (labels.to(device) + 1),
                         }
                     )
 
@@ -1277,7 +1320,7 @@ def _evaluate_torchvision_frcnn(
                         converted_targets.append(
                             {
                                 "boxes": boxes_abs.to(device),
-                                "labels": labels.to(device),
+                                "labels": (labels.to(device) + 1),
                             }
                         )
 
@@ -1308,11 +1351,15 @@ def _evaluate_torchvision_frcnn(
                 f"train_loss={avg_train_loss:.4f} val_loss={avg_val_loss:.4f}"
             )
 
+            # Get current learning rate
+            current_lr = optimizer.param_groups[0]["lr"] if optimizer.param_groups else 0.0
+            
             metrics_rows.append(
                 {
                     "epoch": epoch + 1,
                     "train_loss": avg_train_loss,
                     "val_loss": avg_val_loss,
+                    "learning_rate": current_lr,
                 }
             )
 
@@ -1360,6 +1407,7 @@ def _evaluate_torchvision_frcnn(
             eval_cfg_local = getattr(config, "evaluation", {}) or {}
             save_predictions_flag = bool(eval_cfg_local.get("save_predictions", False))
             predictions_path = eval_cfg_local.get("predictions_path")
+            saved_predictions_path: Optional[str] = None
             if save_predictions_flag:
                 import json
 
@@ -1372,7 +1420,7 @@ def _evaluate_torchvision_frcnn(
                 out_path.parent.mkdir(parents=True, exist_ok=True)
                 with out_path.open("w", encoding="utf-8") as f:
                     json.dump(coco_predictions, f)
-                coco_metrics["predictions_json"] = str(out_path)
+                saved_predictions_path = str(out_path)
 
             map_iou_thresholds = eval_cfg_local.get("map_iou_thresholds")
             if isinstance(map_iou_thresholds, (list, tuple)):
@@ -1382,38 +1430,70 @@ def _evaluate_torchvision_frcnn(
             coco_metrics = compute_coco_map(
                 coco_gt, coco_predictions, iou_thresholds=map_iou_thresholds
             )
+            if saved_predictions_path is not None:
+                coco_metrics["predictions_json"] = saved_predictions_path
         except Exception as exc:
             coco_metrics = {"note": f"COCO mAP computation failed: {exc}"}
+            if saved_predictions_path is not None:
+                coco_metrics["predictions_json"] = saved_predictions_path
 
-    # Write CSV report (without extra_summary - that parameter doesn't exist)
-    try:
-        write_report_csv(
-            report_path,
-            metrics_rows,
-            config=config,
-            emissions_kg=emissions_kg_total,
-            energy_kwh=energy_kwh_total,
-            duration_seconds=duration_seconds,
-        )
-        # Append mAP summary to CSV manually if we have coco_metrics
-        if coco_metrics and "map" in coco_metrics:
-            try:
-                import csv
-                report_path.parent.mkdir(parents=True, exist_ok=True)
-                with report_path.open("a", newline="") as f:
-                    writer = csv.DictWriter(f, fieldnames=["map", "map50", "map75", "predictions_json"])
-                    if f.tell() == 0:  # File is empty, write header
-                        writer.writeheader()
-                    writer.writerow({
-                        "map": coco_metrics.get("map", ""),
-                        "map50": coco_metrics.get("map50", ""),
-                        "map75": coco_metrics.get("map75", ""),
+    # Write CSV report (using same format as _evaluate_detection)
+    if save_model and metrics_rows:
+        try:
+            import csv
+
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            with report_path.open("w", newline="") as f:
+                fieldnames = [
+                    "epoch",
+                    "train_loss",
+                    "val_loss",
+                    "learning_rate",
+                    "map",
+                    "map50",
+                    "map75",
+                    "predictions_json",
+                    "emissions_kg",
+                    "energy_kwh",
+                    "duration_seconds",
+                ]
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in metrics_rows:
+                    # Ensure consistent schema for all rows
+                    row_dict = {
+                        "epoch": row.get("epoch", ""),
+                        "train_loss": f"{row.get('train_loss', 0.0):.6f}",
+                        "val_loss": f"{row.get('val_loss', 0.0):.6f}",
+                        "learning_rate": f"{row.get('learning_rate', 0.0):.6f}",
+                        "map": "",
+                        "map50": "",
+                        "map75": "",
+                        "predictions_json": "",
+                        "emissions_kg": "",
+                        "energy_kwh": "",
+                        "duration_seconds": "",
+                    }
+                    writer.writerow(row_dict)
+                
+                # Add summary row with mAP and emissions if available
+                if coco_metrics or emissions_kg_total is not None:
+                    summary_row = {
+                        "epoch": "summary",
+                        "train_loss": "",
+                        "val_loss": "",
+                        "learning_rate": "",
+                        "map": f"{coco_metrics.get('map', ''):.6f}" if coco_metrics.get("map") is not None else "",
+                        "map50": f"{coco_metrics.get('map50', ''):.6f}" if coco_metrics.get("map50") is not None else "",
+                        "map75": f"{coco_metrics.get('map75', ''):.6f}" if coco_metrics.get("map75") is not None else "",
                         "predictions_json": coco_metrics.get("predictions_json", ""),
-                    })
-            except Exception as exc2:
-                print(f"[warn] Failed to append mAP summary to CSV: {exc2}")
-    except Exception as exc:
-        print(f"[warn] Failed to write detection CSV report to {report_path}: {exc}")
+                        "emissions_kg": f"{emissions_kg_total:.6f}" if emissions_kg_total is not None else "",
+                        "energy_kwh": f"{energy_kwh_total:.6f}" if energy_kwh_total is not None else "",
+                        "duration_seconds": f"{duration_seconds:.2f}" if duration_seconds is not None else "",
+                    }
+                    writer.writerow(summary_row)
+        except Exception as exc:
+            print(f"[warn] Failed to write detection CSV report to {report_path}: {exc}")
 
     results = {
         "head_type": "torchvision_frcnn",

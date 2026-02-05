@@ -1,0 +1,32 @@
+model: mobilenet_v3_small
+database: toy_detection  # Tiny synthetic detection dataset (no download required)
+device: cuda:1
+seed: 42
+
+evaluation:
+  enabled: true
+  # Point this to any pretrained checkpoint you want to test with a detection head
+  checkpoint_path: outputs_old2/mobilenet_small_supcon_mperclass_cifar10_v3/mobilenet_small_supcon_mperclass_cifar10_v3_cycle10.pt
+  head_type: detection
+  num_anchors: 9
+  hidden_dim: 256
+
+hyperparameters:
+  batch_size: 4           # Very small for quick tests
+  lr: 0.001
+  epochs: 5               # Just sanity‑check the pipeline
+  momentum: 0.9
+  num_workers: 2
+  val_split: 0.0          # Not used for synthetic toy dataset
+  image_size: 96          # Matches tiny synthetic dataset size
+  projection_dim: 128     # Must match original training
+  projection_hidden_dim: 2048
+  projection_use_bn: true
+
+# Kept for compatibility with the rest of the training code
+optimizer: sgd
+loss_function: cross_entropy
+weight_decay: 0.0001
+save_model: false
+freeze_backbone: true
+

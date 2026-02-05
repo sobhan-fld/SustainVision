@@ -1,0 +1,69 @@
+model: resnet18
+database: coco
+device: cuda:2
+seed: 42
+
+# Training from scratch - no checkpoint needed
+optimizer: adamw
+loss_function: cross_entropy
+weight_decay: 0.0001
+
+scheduler:
+  type: warmup_cosine
+  params:
+    eta_min: 0.0001
+    t_max: 200  # Will be auto-adjusted to epochs in code
+    warmup_epochs: 10  # 10 epochs warmup
+    warmup_start_factor: 0.1
+
+mixed_precision: false
+save_model: true
+save_model_path: output_object_detection/resnet18_coco_detection_from_scratch_cuda2
+report_filename: output_object_detection/resnet18_coco_detection_from_scratch_cuda2/detection_metrics.csv
+
+evaluation:
+  enabled: true
+  head_type: detection
+  # No checkpoint_path - training from scratch
+  checkpoint_path: null
+  freeze_backbone: false  # Train everything from scratch
+  num_anchors: 100
+  hidden_dim: 512
+  use_bn: true
+  dropout: 0.1
+  save_predictions: true
+  predictions_path: output_object_detection/resnet18_coco_detection_from_scratch_cuda2/coco_predictions.json
+  nms_threshold: 0.5
+  map_iou_thresholds: null  # null -> COCO default mAP@[0.5:0.95]
+  filter_coco_to_cifar100: false  # Use full 80 COCO classes
+
+hyperparameters:
+  batch_size: 96  # Increased for RTX 2080 Ti (11GB VRAM) - was 32
+  lr: 0.0015  # Slightly increased LR for larger batch size
+  epochs: 200  # More epochs needed for from-scratch training
+  momentum: 0.9
+  num_workers: 12  # Increased for faster data loading
+  image_size: 224
+  gradient_clip_norm: 1.0
+  checkpoint_interval: 50  # Save model every 50 epochs
+
+  # Projection settings (for model building, not used in detection)
+  projection_dim: 128
+  projection_hidden_dim: 2048
+  projection_use_bn: true
+
+  # Detection-loss + evaluation knobs
+  bbox_loss_weight: 30.0
+  bbox_loss_max_weight: 50.0
+  bbox_loss_warmup_epochs: 10
+  match_iou_threshold: 0.1
+  iou_threshold: 0.5
+  score_threshold: 0.01
+  nms_iou_threshold: 0.5
+
+  # CodeCarbon
+  track_emissions: true
+
+  # Optional: limit dataset size for faster training
+  max_train_images: null  # Use full dataset
+  max_val_images: null

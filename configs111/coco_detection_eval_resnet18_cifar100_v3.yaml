@@ -1,0 +1,39 @@
+model: resnet18
+database: coco          # Uses COCO detection dataset under databases/coco
+device: cuda:1            # Adjust to cuda:0 / cuda:1 if you want a specific GPU
+seed: 42
+
+evaluation:
+  enabled: true
+  # Use the final linear-eval checkpoint from the CIFAR100 SupCon v3 run as backbone
+  checkpoint_path: outputs_old2/resnet18_supcon_full_cifar100_v3/resnet18_supcon_full_cifar100_v3_cycle10.pt
+  head_type: detection
+  num_anchors: 16         # More anchors for a slightly richer detection head
+  hidden_dim: 512         # Larger MLP head for better capacity
+
+hyperparameters:
+  batch_size: 4           # Keep small for COCO at higher resolution
+  lr: 0.001
+  epochs: 1               # Very short run, just to sanity-check detection
+  momentum: 0.9
+  num_workers: 4
+  val_split: 0.0
+  image_size: 224         # More realistic resolution for COCO detection
+  # QUICK TEST LIMITERS (so it doesn't look "stuck")
+  max_train_images: 128
+  max_val_images: 64
+  max_train_batches: 20
+  max_val_batches: 10
+  log_every: 5
+  iou_threshold: 0.5      # IoU threshold for detection recall metric
+  projection_dim: 128     # Must match original SupCon training
+  projection_hidden_dim: 2048
+  projection_use_bn: true
+
+# Kept for compatibility with training loop, but evaluation.enabled routes to detection eval
+optimizer: sgd
+loss_function: cross_entropy
+weight_decay: 0.0001
+save_model: false
+freeze_backbone: true     # Keep CIFAR100 backbone frozen; only train detection head
+

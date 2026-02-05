@@ -242,28 +242,28 @@ def _run_finetune_phase(
     else:
         # Use classification head (original behavior)
         print(f"[info] Starting finetune phase: {finetune_label} (backbone frozen, classification head)")
-        
-        summary, state = _execute_training_phase(
-            config,
-            project_root=project_dir,
-            report_path=report_path,
-            phase_label=finetune_label,
-            initial_state=model_state,
-            write_outputs=False,
-            loss_function_override=params["finetune_loss"],
-            epochs_override=params["finetune_epochs"],
-            lr_override=params["finetune_lr"],
-            optimizer_override=params.get("finetune_optimizer"),
-            weight_decay_override=params.get("finetune_weight_decay"),
-            freeze_backbone_override=params["freeze_backbone"],
-            skip_emissions_tracker=False,
-            reset_classifier=params["freeze_backbone"],  # Reset classifier to evaluate backbone quality
-            scheduler_config_override=None,
-            simclr_recipe_override=params["use_reference_transforms"],
-            subset_per_class_override=params.get("linear_subset_per_class"),
-            subset_seed_override=params.get("linear_subset_seed"),
-        )
-        return summary, state
+    
+    summary, state = _execute_training_phase(
+        config,
+        project_root=project_dir,
+        report_path=report_path,
+        phase_label=finetune_label,
+        initial_state=model_state,
+        write_outputs=False,
+        loss_function_override=params["finetune_loss"],
+        epochs_override=params["finetune_epochs"],
+        lr_override=params["finetune_lr"],
+        optimizer_override=params.get("finetune_optimizer"),
+        weight_decay_override=params.get("finetune_weight_decay"),
+        freeze_backbone_override=params["freeze_backbone"],
+        skip_emissions_tracker=False,
+        reset_classifier=params["freeze_backbone"],  # Reset classifier to evaluate backbone quality
+        scheduler_config_override=None,
+        simclr_recipe_override=params["use_reference_transforms"],
+        subset_per_class_override=params.get("linear_subset_per_class"),
+        subset_seed_override=params.get("linear_subset_seed"),
+    )
+    return summary, state
 
 
 def _save_cycle_checkpoint(

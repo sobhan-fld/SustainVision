@@ -1,0 +1,35 @@
+# Classification evaluation config for pretrained MobileNet Small SupCon on CIFAR-10
+# 
+# This tests the evaluation pipeline with classification head
+# while you work on downloading detection datasets
+
+model: mobilenet_v3_small
+database: databases/cifar10
+device: cuda:0
+seed: 42
+
+# Evaluation configuration
+evaluation:
+  enabled: true
+  checkpoint_path: outputs_old2/mobilenet_small_supcon_mperclass_cifar10_v3/mobilenet_small_supcon_mperclass_cifar10_v3_cycle10.pt
+  head_type: classification  # Testing classification evaluation first
+
+# Hyperparameters for training the classification head
+hyperparameters:
+  batch_size: 256
+  lr: 0.01  # Learning rate for training the head (backbone stays frozen)
+  epochs: 20  # Number of epochs to train the head
+  momentum: 0.9
+  num_workers: 12
+  val_split: 0.0  # Use CIFAR-10 test set
+  image_size: 32  # CIFAR-10 image size
+  projection_dim: 128  # Must match original training
+  projection_hidden_dim: 2048  # Must match original training
+  projection_use_bn: true  # Must match original training
+
+# These are not used during evaluation but kept for compatibility
+optimizer: sgd
+loss_function: cross_entropy
+weight_decay: 0.0001
+save_model: false
+freeze_backbone: true  # Always true during evaluation

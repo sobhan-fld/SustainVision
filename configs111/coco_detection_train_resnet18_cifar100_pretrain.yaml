@@ -1,0 +1,42 @@
+model: resnet18
+database: coco          # Uses COCO detection dataset under databases/coco
+device: cuda:1            # Adjust to cuda:0 / cuda:1 if you want a specific GPU
+seed: 42
+
+evaluation:
+  enabled: true
+  # Use the SupCon-pretrained CIFAR100 backbone (before final finetune) as backbone
+  checkpoint_path: outputs_old2/resnet18_supcon_full_cifar100_v3/resnet18_supcon_full_cifar100_v3_cycle10.pt
+  head_type: detection
+  num_anchors: 16         # More anchors for richer detection capacity
+  hidden_dim: 512         # Larger head MLP
+
+hyperparameters:
+  batch_size: 16          # COCO at higher resolution; reduce batch to avoid OOM
+  lr: 0.001
+  epochs: 100
+  momentum: 0.9
+  num_workers: 4
+  val_split: 0.0
+  image_size: 224         # More realistic resolution for COCO detection
+  max_train_images: 4096
+  max_val_images: 1024
+  # Let it run full batches; you can reduce if needed
+  max_train_batches: null
+  max_val_batches: null
+  log_every: 50
+  iou_threshold: 0.2
+  checkpoint_interval: 50 # Save checkpoints every 50 epochs (and final)
+  projection_dim: 128     # Must match original SupCon training
+  projection_hidden_dim: 2048
+  projection_use_bn: true
+
+# Save detection-head checkpoints and CSV logs in a dedicated object detection folder
+optimizer: sgd
+loss_function: cross_entropy
+weight_decay: 0.0001
+save_model: true
+save_model_path: output_object_detection/resnet18_coco_from_cifar100_pretrain
+report_filename: output_object_detection/resnet18_coco_from_cifar100_pretrain/resnet18_coco_from_cifar100_pretrain.csv
+freeze_backbone: true     # Keep CIFAR100 backbone frozen; only train detection head
+
