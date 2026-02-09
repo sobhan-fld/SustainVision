@@ -700,6 +700,86 @@ def generate_coco_predictions_torchvision(
     return preds
 
 
+def generate_voc_predictions_torchvision(
+    model: "torch.nn.Module",
+    dataloader: DataLoader,
+    *,
+    device: "torch.device",
+    score_threshold: float,
+    max_batches: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Generate VOC-style predictions from a torchvision detection model."""
+    if torch is None:
+        raise RuntimeError("PyTorch is required")
+
+    model.eval()
+    preds: List[Dict[str, Any]] = []
+
+    old_model_thresh: Optional[float] = None
+    try:
+        if hasattr(model, "roi_heads") and hasattr(model.roi_heads, "score_thresh"):
+            old_model_thresh = float(model.roi_heads.score_thresh)
+            model.roi_heads.score_thresh = float(score_threshold)
+    except Exception:
+        old_model_thresh = None
+
+    image_index = 0
+    try:
+        with torch.no_grad():
+            for batch_idx, (images, targets) in enumerate(dataloader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+
+                images_list: List[torch.Tensor] = [img.to(device) for img in images]
+                outputs = model(images_list)  # type: ignore[call-arg]
+
+                if isinstance(outputs, dict):
+                    continue
+
+                for out, tgt, img in zip(outputs, targets, images):
+                    boxes = out.get("boxes")
+                    labels = out.get("labels")
+                    scores = out.get("scores")
+                    if boxes is None or labels is None or scores is None:
+                        image_index += 1
+                        continue
+
+                    orig_size = tgt.get("orig_size", None) if isinstance(tgt, dict) else None
+                    in_h = int(img.shape[1])
+                    in_w = int(img.shape[2])
+
+                    boxes_scaled = boxes
+                    if orig_size is not None:
+                        try:
+                            orig_h = int(orig_size[0])
+                            orig_w = int(orig_size[1])
+                            if in_h > 0 and in_w > 0:
+                                scale = boxes.new_tensor(
+                                    [orig_w / in_w, orig_h / in_h, orig_w / in_w, orig_h / in_h]
+                                )
+                                boxes_scaled = boxes * scale
+                        except Exception:
+                            boxes_scaled = boxes
+
+                    preds.append(
+                        {
+                            "image_id": image_index,
+                            "boxes": boxes_scaled.detach().cpu().tolist(),
+                            "scores": scores.detach().cpu().tolist(),
+                            "labels": (labels.detach().cpu() - 1).clamp(min=0).tolist(),
+                        }
+                    )
+                    image_index += 1
+    finally:
+        try:
+            if old_model_thresh is not None and hasattr(model, "roi_heads"):
+                model.roi_heads.score_thresh = old_model_thresh
+        except Exception:
+            pass
+
+    return preds
+
+
 def generate_coco_predictions(
     model: MultiHeadModel,
     dataloader: DataLoader,
@@ -833,6 +913,130 @@ def compute_coco_map(
         "map": float(stats[0]),
         "map50": float(stats[1]),
         "map75": float(stats[2]),
+        "per_class_ap": per_class_ap,
+    }
+
+
+def compute_voc_map50(
+    ground_truths: List[Dict[str, Any]],
+    predictions: List[Dict[str, Any]],
+    *,
+    num_classes: int,
+) -> Dict[str, Any]:
+    """Compute Pascal VOC mAP@0.5 using continuous AP (VOC2010/2012 style)."""
+
+    def _iou(box: list[float], boxes: list[list[float]]) -> Tuple[float, int]:
+        best_iou = 0.0
+        best_idx = -1
+        x1, y1, x2, y2 = box
+        box_area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        for idx, b in enumerate(boxes):
+            xx1 = max(x1, b[0])
+            yy1 = max(y1, b[1])
+            xx2 = min(x2, b[2])
+            yy2 = min(y2, b[3])
+            w = max(0.0, xx2 - xx1)
+            h = max(0.0, yy2 - yy1)
+            inter = w * h
+            if inter <= 0:
+                continue
+            b_area = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+            union = box_area + b_area - inter
+            if union <= 0:
+                continue
+            iou = inter / union
+            if iou > best_iou:
+                best_iou = iou
+                best_idx = idx
+        return best_iou, best_idx
+
+    def _voc_ap(rec: list[float], prec: list[float]) -> float:
+        mrec = [0.0] + rec + [1.0]
+        mpre = [0.0] + prec + [0.0]
+        for i in range(len(mpre) - 1, 0, -1):
+            if mpre[i - 1] < mpre[i]:
+                mpre[i - 1] = mpre[i]
+        ap = 0.0
+        for i in range(1, len(mrec)):
+            if mrec[i] != mrec[i - 1]:
+                ap += (mrec[i] - mrec[i - 1]) * mpre[i]
+        return ap
+
+    gt_by_class: list[Dict[int, Dict[str, Any]]] = []
+    gt_count_by_class: list[int] = []
+    for cls in range(num_classes):
+        gt_by_image: Dict[int, Dict[str, Any]] = {}
+        total = 0
+        for gt in ground_truths:
+            image_id = int(gt["image_id"])
+            boxes = gt["boxes"]
+            labels = gt["labels"]
+            cls_boxes = [
+                box for box, label in zip(boxes, labels) if int(label) == cls
+            ]
+            if not cls_boxes:
+                continue
+            gt_by_image[image_id] = {
+                "boxes": cls_boxes,
+                "matched": [False] * len(cls_boxes),
+            }
+            total += len(cls_boxes)
+        gt_by_class.append(gt_by_image)
+        gt_count_by_class.append(total)
+
+    per_class_ap: Dict[int, float] = {}
+    ap_values: list[float] = []
+
+    for cls in range(num_classes):
+        cls_preds: list[Tuple[int, float, list[float]]] = []
+        for pred in predictions:
+            image_id = int(pred["image_id"])
+            boxes = pred["boxes"]
+            scores = pred["scores"]
+            labels = pred["labels"]
+            for box, score, label in zip(boxes, scores, labels):
+                if int(label) == cls:
+                    cls_preds.append((image_id, float(score), box))
+
+        cls_preds.sort(key=lambda x: x[1], reverse=True)
+        tp = [0.0] * len(cls_preds)
+        fp = [0.0] * len(cls_preds)
+
+        gt_by_image = gt_by_class[cls]
+        for i, (image_id, _, box) in enumerate(cls_preds):
+            gt_record = gt_by_image.get(image_id)
+            if gt_record is None:
+                fp[i] = 1.0
+                continue
+            iou, match_idx = _iou(box, gt_record["boxes"])
+            if iou >= 0.5 and match_idx >= 0 and not gt_record["matched"][match_idx]:
+                tp[i] = 1.0
+                gt_record["matched"][match_idx] = True
+            else:
+                fp[i] = 1.0
+
+        gt_total = gt_count_by_class[cls]
+        if gt_total == 0:
+            per_class_ap[cls] = float("nan")
+            continue
+
+        cum_tp = 0.0
+        cum_fp = 0.0
+        rec: list[float] = []
+        prec: list[float] = []
+        for i in range(len(tp)):
+            cum_tp += tp[i]
+            cum_fp += fp[i]
+            rec.append(cum_tp / gt_total)
+            prec.append(cum_tp / max(cum_tp + cum_fp, 1e-12))
+
+        ap = _voc_ap(rec, prec)
+        per_class_ap[cls] = ap
+        ap_values.append(ap)
+
+    map50 = float(sum(ap_values) / len(ap_values)) if ap_values else 0.0
+    return {
+        "map50": map50,
         "per_class_ap": per_class_ap,
     }
 
@@ -1078,10 +1282,38 @@ def _evaluate_torchvision_frcnn(
     print(f"[info] Building dataloaders for dataset: {config.database}")
     eval_cfg = getattr(config, "evaluation", {}) or {}
     filter_classes = None
-    if eval_cfg.get("filter_coco_to_cifar100", False):
+    class_remap = None
+    if eval_cfg.get("filter_coco_to_cifar100", False) and config.database.lower() == "coco":
         from .data import get_coco_classes_for_cifar100
 
         filter_classes = get_coco_classes_for_cifar100()
+
+    if "voc" in config.database.lower():
+        voc_subset = eval_cfg.get("voc_subset_classes")
+        if isinstance(voc_subset, str):
+            voc_subset = voc_subset.strip().lower()
+            if voc_subset in {"cifar10", "cifar"}:
+                from .data import VOC_CIFAR10_SUBSET
+
+                voc_subset = VOC_CIFAR10_SUBSET
+            else:
+                voc_subset = None
+        if isinstance(voc_subset, (list, tuple)) and len(voc_subset) > 0:
+            from .data import resolve_voc_class_id
+
+            ordered_ids: List[int] = []
+            for entry in voc_subset:
+                if isinstance(entry, int):
+                    resolved = entry
+                else:
+                    resolved = resolve_voc_class_id(str(entry))
+                if resolved is None:
+                    continue
+                if resolved not in ordered_ids:
+                    ordered_ids.append(resolved)
+            if ordered_ids:
+                filter_classes = set(ordered_ids)
+                class_remap = {old_id: new_idx for new_idx, old_id in enumerate(ordered_ids)}
 
     train_loader, val_loader, dataset_num_classes = build_detection_dataloaders(
         config.database,
@@ -1094,7 +1326,9 @@ def _evaluate_torchvision_frcnn(
         max_train_images=config.hyperparameters.get("max_train_images"),
         max_val_images=config.hyperparameters.get("max_val_images"),
         filter_classes=filter_classes,
+        class_remap=class_remap,
         # Important: torchvision Faster R-CNN normalizes internally.
+        resize_images=False,
         normalize_images=False,
     )
 
@@ -1103,26 +1337,58 @@ def _evaluate_torchvision_frcnn(
 
     print("[info] Building torchvision Faster R-CNN (ResNet-18 + FPN) detector")
     backbone = resnet_fpn_backbone("resnet18", pretrained=False, trainable_layers=5)  # type: ignore[call-arg]
-    model = FasterRCNN(backbone, num_classes=num_classes_with_bg)  # type: ignore[call-arg]
 
-    # TODO: Map SupCon ResNet18 weights into backbone.body.* when checkpoint_path is provided.
     if checkpoint_path is not None:
-        print(
-            "[warn] Loading SupCon/contrastive checkpoints into torchvision_frcnn "
-            "is not implemented yet; training detector from scratch."
-        )
+        checkpoint_path = Path(checkpoint_path)
+        if not checkpoint_path.is_absolute():
+            checkpoint_path = (root / checkpoint_path).resolve()
+        print(f"[info] Loading pretrained backbone weights from: {checkpoint_path}")
+        try:
+            backbone_image_size = int(
+                config.hyperparameters.get(
+                    "backbone_image_size",
+                    config.hyperparameters.get("image_size", 224),
+                )
+            )
+            supcon_backbone = load_pretrained_backbone(
+                checkpoint_path,
+                config.model,
+                backbone_image_size,
+                projection_dim=config.hyperparameters.get("projection_dim", 128),
+                projection_hidden_dim=config.hyperparameters.get("projection_hidden_dim"),
+                projection_use_bn=config.hyperparameters.get("projection_use_bn", False),
+            )
+            missing, unexpected = backbone.body.load_state_dict(
+                supcon_backbone.state_dict(),
+                strict=False,
+            )
+            if missing:
+                print(f"[info] Backbone load missing keys: {len(missing)}")
+            if unexpected:
+                print(f"[info] Backbone load unexpected keys: {len(unexpected)}")
+        except Exception as exc:
+            print(f"[warn] Failed to load backbone weights: {exc}")
+
+    model = FasterRCNN(backbone, num_classes=num_classes_with_bg)  # type: ignore[call-arg]
 
     model.to(device)
 
-    base_lr = float(
-        config.hyperparameters.get(
-            "backbone_lr", config.hyperparameters.get("lr", 0.01)
-        )
-    )
+    base_lr = float(config.hyperparameters.get("lr", 0.01))
+    backbone_lr = float(config.hyperparameters.get("backbone_lr", base_lr))
+    head_lr = float(config.hyperparameters.get("head_lr", base_lr))
+    freeze_backbone_epochs = int(config.hyperparameters.get("freeze_backbone_epochs", 0))
+
+    backbone_params = list(model.backbone.parameters())
+    backbone_param_ids = {id(p) for p in backbone_params}
+    head_params = [p for p in model.parameters() if id(p) not in backbone_param_ids]
+
     optimizer = build_optimizer(
         config.optimizer,
-        model.parameters(),
-        lr=base_lr,
+        [
+            {"params": backbone_params, "lr": backbone_lr},
+            {"params": head_params, "lr": head_lr},
+        ],
+        lr=head_lr,
         momentum=config.hyperparameters.get("momentum", 0.9),
         weight_decay=config.weight_decay,
     )
@@ -1212,6 +1478,18 @@ def _evaluate_torchvision_frcnn(
         for epoch in range(epochs):
             if track_emissions and (epoch % 10 == 0) and block_tracker is None:
                 block_tracker = _start_block_tracker()
+
+            # Optional: freeze backbone for early epochs to reduce overfitting.
+            if freeze_backbone_epochs > 0 and epoch < freeze_backbone_epochs:
+                for param in backbone_params:
+                    param.requires_grad = False
+                optimizer.param_groups[0]["lr"] = 0.0
+                model.backbone.eval()
+            else:
+                for param in backbone_params:
+                    param.requires_grad = True
+                optimizer.param_groups[0]["lr"] = backbone_lr
+                model.backbone.train()
 
             # --------------------
             # Training
@@ -1393,8 +1671,14 @@ def _evaluate_torchvision_frcnn(
                 pass
 
     # COCO mAP via pycocotools
+    eval_cfg_local = getattr(config, "evaluation", {}) or {}
+    save_predictions_flag = bool(eval_cfg_local.get("save_predictions", False))
+    predictions_path = eval_cfg_local.get("predictions_path")
+
     coco_metrics: Dict[str, Any] = {}
+    voc_metrics: Dict[str, Any] = {}
     coco_gt = _get_coco_api_from_dataset(getattr(val_loader, "dataset", None))
+    saved_predictions_path: Optional[str] = None
     if coco_gt is not None:
         try:
             coco_predictions = generate_coco_predictions_torchvision(
@@ -1404,10 +1688,6 @@ def _evaluate_torchvision_frcnn(
                 score_threshold=score_threshold,
                 max_batches=max_val_batches,
             )
-            eval_cfg_local = getattr(config, "evaluation", {}) or {}
-            save_predictions_flag = bool(eval_cfg_local.get("save_predictions", False))
-            predictions_path = eval_cfg_local.get("predictions_path")
-            saved_predictions_path: Optional[str] = None
             if save_predictions_flag:
                 import json
 
@@ -1436,11 +1716,83 @@ def _evaluate_torchvision_frcnn(
             coco_metrics = {"note": f"COCO mAP computation failed: {exc}"}
             if saved_predictions_path is not None:
                 coco_metrics["predictions_json"] = saved_predictions_path
+    elif "voc" in config.database.lower():
+        try:
+            voc_predictions = generate_voc_predictions_torchvision(
+                model,
+                val_loader,
+                device=device,
+                score_threshold=score_threshold,
+                max_batches=max_val_batches,
+            )
+
+            if save_predictions_flag:
+                import json
+
+                if isinstance(predictions_path, str) and predictions_path.strip():
+                    out_path = Path(predictions_path.strip())
+                    if not out_path.is_absolute():
+                        out_path = (Path.cwd() / out_path).resolve()
+                else:
+                    out_path = save_dir / "voc_predictions_torchvision.json"
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                with out_path.open("w", encoding="utf-8") as f:
+                    json.dump(voc_predictions, f)
+                saved_predictions_path = str(out_path)
+
+            voc_ground_truths: List[Dict[str, Any]] = []
+            image_index = 0
+            for batch_idx, (images, targets) in enumerate(val_loader):
+                if max_val_batches is not None and batch_idx >= max_val_batches:
+                    break
+                for img, tgt in zip(images, targets):
+                    if not isinstance(tgt, dict) or "boxes" not in tgt or "labels" not in tgt:
+                        image_index += 1
+                        continue
+                    boxes_norm = tgt["boxes"]
+                    labels = tgt["labels"]
+                    orig_size = tgt.get("orig_size", None)
+                    if orig_size is not None:
+                        try:
+                            orig_h = int(orig_size[0])
+                            orig_w = int(orig_size[1])
+                        except Exception:
+                            orig_h = int(img.shape[1])
+                            orig_w = int(img.shape[2])
+                    else:
+                        orig_h = int(img.shape[1])
+                        orig_w = int(img.shape[2])
+                    boxes_abs = _denormalize_boxes_xyxy(
+                        boxes_norm,
+                        orig_h=orig_h,
+                        orig_w=orig_w,
+                    )
+                    voc_ground_truths.append(
+                        {
+                            "image_id": image_index,
+                            "boxes": boxes_abs.detach().cpu().tolist(),
+                            "labels": labels.detach().cpu().tolist(),
+                        }
+                    )
+                    image_index += 1
+
+            voc_metrics = compute_voc_map50(
+                voc_ground_truths,
+                voc_predictions,
+                num_classes=num_classes,
+            )
+            if saved_predictions_path is not None:
+                voc_metrics["predictions_json"] = saved_predictions_path
+        except Exception as exc:
+            voc_metrics = {"note": f"VOC mAP computation failed: {exc}"}
+            if saved_predictions_path is not None:
+                voc_metrics["predictions_json"] = saved_predictions_path
 
     # Write CSV report (using same format as _evaluate_detection)
     if save_model and metrics_rows:
         try:
             import csv
+            import datetime
 
             report_path.parent.mkdir(parents=True, exist_ok=True)
             with report_path.open("w", newline="") as f:
@@ -1456,6 +1808,7 @@ def _evaluate_torchvision_frcnn(
                     "emissions_kg",
                     "energy_kwh",
                     "duration_seconds",
+                    "finished_at",
                 ]
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
@@ -1473,27 +1826,46 @@ def _evaluate_torchvision_frcnn(
                         "emissions_kg": "",
                         "energy_kwh": "",
                         "duration_seconds": "",
+                        "finished_at": "",
                     }
                     writer.writerow(row_dict)
                 
                 # Add summary row with mAP and emissions if available
-                if coco_metrics or emissions_kg_total is not None:
+                if coco_metrics or voc_metrics or emissions_kg_total is not None:
+                    map_val = coco_metrics.get("map") if coco_metrics else None
+                    map50_val = coco_metrics.get("map50") if coco_metrics else voc_metrics.get("map50")
+                    map75_val = coco_metrics.get("map75") if coco_metrics else None
+                    predictions_json = coco_metrics.get("predictions_json", "") if coco_metrics else voc_metrics.get("predictions_json", "")
+                    finished_at = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
                     summary_row = {
                         "epoch": "summary",
                         "train_loss": "",
                         "val_loss": "",
                         "learning_rate": "",
-                        "map": f"{coco_metrics.get('map', ''):.6f}" if coco_metrics.get("map") is not None else "",
-                        "map50": f"{coco_metrics.get('map50', ''):.6f}" if coco_metrics.get("map50") is not None else "",
-                        "map75": f"{coco_metrics.get('map75', ''):.6f}" if coco_metrics.get("map75") is not None else "",
-                        "predictions_json": coco_metrics.get("predictions_json", ""),
+                        "map": f"{map_val:.6f}" if map_val is not None else "",
+                        "map50": f"{map50_val:.6f}" if map50_val is not None else "",
+                        "map75": f"{map75_val:.6f}" if map75_val is not None else "",
+                        "predictions_json": predictions_json or "",
                         "emissions_kg": f"{emissions_kg_total:.6f}" if emissions_kg_total is not None else "",
                         "energy_kwh": f"{energy_kwh_total:.6f}" if energy_kwh_total is not None else "",
                         "duration_seconds": f"{duration_seconds:.2f}" if duration_seconds is not None else "",
+                        "finished_at": finished_at,
                     }
                     writer.writerow(summary_row)
         except Exception as exc:
             print(f"[warn] Failed to write detection CSV report to {report_path}: {exc}")
+
+    # Save a YAML snapshot of the config next to the weights/metrics.
+    if save_model:
+        try:
+            import yaml  # type: ignore
+
+            cfg_path = save_dir / "config.yaml"
+            data = getattr(config, "__dict__", {})
+            with cfg_path.open("w", encoding="utf-8") as f:
+                yaml.safe_dump(data, f, sort_keys=False)
+        except Exception as exc:  # pragma: no cover - best-effort
+            print(f"[warn] Failed to write config snapshot to {save_dir}: {exc}")
 
     results = {
         "head_type": "torchvision_frcnn",
@@ -1504,6 +1876,7 @@ def _evaluate_torchvision_frcnn(
         "duration_seconds": duration_seconds,
     }
     results.update(coco_metrics)
+    results.update(voc_metrics)
     return results
 
 
@@ -1835,29 +2208,27 @@ def _evaluate_detection(
     
     try:
         for epoch in range(epochs):
-            # Start a new 10-epoch energy tracking block at epochs 1, 11, 21, ...
-            # (epoch 0 -> start block, epoch 10 -> stop and start new, etc.)
-            if track_emissions and ((epoch) % 10 == 0) and block_tracker is None:
+            if track_emissions and (epoch % 10 == 0) and block_tracker is None:
                 block_tracker = _start_block_tracker()
-            
+
+            # --------------------
             # Training
+            # --------------------
             model.train()
-            # If backbone is frozen, keep it in eval mode (for proper BatchNorm behavior)
             freeze_backbone = getattr(model, "freeze_backbone", True)
             if freeze_backbone and hasattr(model, "backbone"):
                 model.backbone.eval()
-            # Ensure head is in train mode
             if hasattr(model, "head"):
                 model.head.train()
-            
+
             train_loss = 0.0
             train_cls_loss = 0.0
             train_bbox_loss = 0.0
             train_samples = 0
-            
-            # Use tqdm for progress bar
+
             try:
                 from tqdm.auto import tqdm
+
                 train_iterable = tqdm(
                     train_loader,
                     desc=f"Train {epoch+1}/{epochs}",
@@ -1866,28 +2237,27 @@ def _evaluate_detection(
                 )
             except ImportError:
                 train_iterable = train_loader
-            
+
             for batch_idx, (images, targets) in enumerate(train_iterable):
                 if max_train_batches is not None and batch_idx >= max_train_batches:
                     break
                 images = images.to(device)
-                
+
                 optimizer.zero_grad()
                 cls_logits, bbox_preds = model(images)
-                
+
                 batch_size = cls_logits.size(0)
                 num_classes = cls_logits.size(2)
-                
-                # Process each image in the batch
+
                 total_cls_loss = 0.0
                 total_bbox_loss = 0.0
                 valid_samples = 0
-                
+
                 for i in range(batch_size):
                     target = targets[i]
                     gt_boxes = target.get("boxes", torch.zeros((0, 4))).to(device)
                     gt_labels = target.get("labels", torch.zeros((0,), dtype=torch.long)).to(device)
-                    
+
                     if len(gt_boxes) == 0:
                         continue
 
@@ -1896,20 +2266,16 @@ def _evaluate_detection(
                         gt_boxes,
                         iou_threshold=match_iou_threshold,
                     )
-                    # More aggressive fallback: always ensure matches for training
                     if matched_pred.numel() == 0:
-                        # Try with very low threshold first
                         matched_pred, matched_gt = match_anchors_to_gt(
                             bbox_preds[i],
                             gt_boxes,
-                            iou_threshold=0.01,  # Very low threshold to ensure some matches
+                            iou_threshold=0.01,
                         )
                         if matched_pred.numel() == 0:
-                            # Still no matches: match each GT to best anchor (one-to-one)
-                            # This ensures every GT box gets a match for training
                             if len(gt_boxes) > 0:
-                                iou = compute_iou(bbox_preds[i], gt_boxes)  # [A, G]
-                                best_anchors = iou.argmax(dim=0)  # [G] - best anchor per GT
+                                iou = compute_iou(bbox_preds[i], gt_boxes)
+                                best_anchors = iou.argmax(dim=0)
                                 matched_pred = best_anchors
                                 matched_gt = torch.arange(len(gt_boxes), device=gt_boxes.device)
                             else:
@@ -1919,18 +2285,17 @@ def _evaluate_detection(
                     assigned_labels = gt_labels[matched_gt]
                     valid_mask = (assigned_labels >= 0) & (assigned_labels < num_classes)
                     if valid_mask.any():
-                        cls_loss = cls_criterion(assigned_cls_logits[valid_mask], assigned_labels[valid_mask]).mean()
+                        cls_loss = cls_criterion(
+                            assigned_cls_logits[valid_mask],
+                            assigned_labels[valid_mask],
+                        ).mean()
                         total_cls_loss += cls_loss
 
                     assigned_bbox_preds = bbox_preds[i, matched_pred]
                     assigned_gt_boxes = gt_boxes[matched_gt]
-                    # Compute bbox loss: sum over coordinates, then average over boxes
-                    # This gives more weight to bbox regression
-                    bbox_loss_per_box = bbox_criterion(assigned_bbox_preds, assigned_gt_boxes).sum(dim=1)  # [N] - sum over 4 coords
-                    bbox_loss = bbox_loss_per_box.mean()  # Average over matched boxes
-                    # Apply adaptive weight (warmup + base weight)
+                    bbox_loss_per_box = bbox_criterion(assigned_bbox_preds, assigned_gt_boxes).sum(dim=1)
+                    bbox_loss = bbox_loss_per_box.mean()
                     if epoch < bbox_loss_warmup_epochs:
-                        # Linear warmup: start at base weight, ramp to max weight
                         warmup_factor = epoch / bbox_loss_warmup_epochs
                         current_weight = bbox_loss_weight + (bbox_loss_max_weight - bbox_loss_weight) * warmup_factor
                     else:
@@ -1938,41 +2303,37 @@ def _evaluate_detection(
                     total_bbox_loss += bbox_loss * current_weight
 
                     valid_samples += 1
-                
+
                 if valid_samples > 0:
                     loss = (total_cls_loss + total_bbox_loss) / valid_samples
                     loss.backward()
-                    
-                    # Gradient clipping for stability
                     if gradient_clip_norm is not None and gradient_clip_norm > 0:
                         torch.nn.utils.clip_grad_norm_(model.head.parameters(), gradient_clip_norm)
-                    
                     optimizer.step()
-                    
+
                     train_loss += loss.item()
                     train_cls_loss += (total_cls_loss / valid_samples).item()
                     train_bbox_loss += (total_bbox_loss / valid_samples).item()
                     train_samples += valid_samples
 
-                # Progress is now shown via tqdm, so we can remove or reduce logging frequency
-                # Keep log_every for backward compatibility but tqdm shows progress automatically
-            
-            avg_train_loss = train_loss / len(train_loader) if len(train_loader) > 0 else 0.0
-            avg_train_cls_loss = train_cls_loss / len(train_loader) if len(train_loader) > 0 else 0.0
-            avg_train_bbox_loss = train_bbox_loss / len(train_loader) if len(train_loader) > 0 else 0.0
-            
+            avg_train_loss = train_loss / max(train_samples, 1)
+            avg_train_cls_loss = train_cls_loss / max(train_samples, 1)
+            avg_train_bbox_loss = train_bbox_loss / max(train_samples, 1)
+
+            # --------------------
             # Validation
+            # --------------------
             model.eval()
             val_loss = 0.0
             val_cls_loss = 0.0
             val_bbox_loss = 0.0
-
+            val_samples = 0
             total_gt_objects = 0
             matched_gt_objects = 0
-            
-            # Use tqdm for validation progress bar
+
             try:
                 from tqdm.auto import tqdm
+
                 val_iterable = tqdm(
                     val_loader,
                     desc=f"Val {epoch+1}/{epochs}",
@@ -1981,24 +2342,25 @@ def _evaluate_detection(
                 )
             except ImportError:
                 val_iterable = val_loader
-            
+
             with torch.no_grad():
                 for batch_idx, (images, targets) in enumerate(val_iterable):
                     if max_val_batches is not None and batch_idx >= max_val_batches:
                         break
                     images = images.to(device)
                     cls_logits, bbox_preds = model(images)
-                    
+
                     batch_size = cls_logits.size(0)
+                    num_classes = cls_logits.size(2)
                     total_cls_loss = 0.0
                     total_bbox_loss = 0.0
                     valid_samples = 0
-                    
+
                     for i in range(batch_size):
                         target = targets[i]
                         gt_boxes = target.get("boxes", torch.zeros((0, 4))).to(device)
                         gt_labels = target.get("labels", torch.zeros((0,), dtype=torch.long)).to(device)
-                        
+
                         if len(gt_boxes) == 0:
                             continue
 
@@ -2007,18 +2369,16 @@ def _evaluate_detection(
                             gt_boxes,
                             iou_threshold=match_iou_threshold,
                         )
-                        # Fallback: if no matches, use best IoU pairs anyway (for early training)
                         if matched_pred.numel() == 0:
                             matched_pred, matched_gt = match_anchors_to_gt(
                                 bbox_preds[i],
                                 gt_boxes,
-                                iou_threshold=0.01,  # Very low threshold to ensure some matches
+                                iou_threshold=0.01,
                             )
                             if matched_pred.numel() == 0:
-                                # Still no matches: match each GT to best anchor (one-to-one)
                                 if len(gt_boxes) > 0:
-                                    iou = compute_iou(bbox_preds[i], gt_boxes)  # [A, G]
-                                    best_anchors = iou.argmax(dim=0)  # [G] - best anchor per GT
+                                    iou = compute_iou(bbox_preds[i], gt_boxes)
+                                    best_anchors = iou.argmax(dim=0)
                                     matched_pred = best_anchors
                                     matched_gt = torch.arange(len(gt_boxes), device=gt_boxes.device)
                                 else:
@@ -2028,21 +2388,21 @@ def _evaluate_detection(
                         assigned_labels = gt_labels[matched_gt]
                         valid_mask = (assigned_labels >= 0) & (assigned_labels < num_classes)
                         if valid_mask.any():
-                            cls_loss = cls_criterion(assigned_cls_logits[valid_mask], assigned_labels[valid_mask]).mean()
+                            cls_loss = cls_criterion(
+                                assigned_cls_logits[valid_mask],
+                                assigned_labels[valid_mask],
+                            ).mean()
                             total_cls_loss += cls_loss
 
                         assigned_bbox_preds = bbox_preds[i, matched_pred]
                         assigned_gt_boxes = gt_boxes[matched_gt]
-                        # Compute bbox loss: sum over coordinates, then average over boxes
-                        bbox_loss_per_box = bbox_criterion(assigned_bbox_preds, assigned_gt_boxes).sum(dim=1)  # [N]
+                        bbox_loss_per_box = bbox_criterion(assigned_bbox_preds, assigned_gt_boxes).sum(dim=1)
                         bbox_loss = bbox_loss_per_box.mean()
-                        # Apply adaptive weight (same as training)
                         if epoch < bbox_loss_warmup_epochs:
                             warmup_factor = epoch / bbox_loss_warmup_epochs
                             current_weight = bbox_loss_weight + (bbox_loss_max_weight - bbox_loss_weight) * warmup_factor
                         else:
                             current_weight = bbox_loss_weight
-                        # Scale by number of matched boxes (same as training)
                         num_matched = len(matched_pred)
                         if num_matched > 0:
                             total_bbox_loss += bbox_loss * current_weight * (1.0 + 0.1 * num_matched)
@@ -2064,18 +2424,29 @@ def _evaluate_detection(
                         )
 
                         total_gt_objects += int(len(gt_boxes))
-                        # Debug: track prediction counts and class accuracy
-                        if (epoch == 0 or epoch == 9 or epoch == 19) and batch_idx == 0 and i == 0:
-                            print(f"[debug] Epoch {epoch+1} - After decode+NMS: {len(pred_boxes)} predictions, {len(gt_boxes)} GT boxes")
+                        if (epoch in {0, 9, 19}) and batch_idx == 0 and i == 0:
+                            print(
+                                f"[debug] Epoch {epoch+1} - After decode+NMS: "
+                                f"{len(pred_boxes)} predictions, {len(gt_boxes)} GT boxes"
+                            )
                             if len(pred_boxes) > 0:
-                                print(f"[debug]   Prediction classes: {pred_labels[:min(5, len(pred_labels))].tolist()}, scores: {pred_scores[:min(5, len(pred_scores))].tolist()}")
+                                print(
+                                    f"[debug]   Prediction classes: "
+                                    f"{pred_labels[:min(5, len(pred_labels))].tolist()}, "
+                                    f"scores: {pred_scores[:min(5, len(pred_scores))].tolist()}"
+                                )
                             if len(gt_boxes) > 0:
-                                print(f"[debug]   GT classes: {gt_labels[:min(5, len(gt_labels))].tolist()}")
-                                # Check if any predictions match GT classes
+                                print(
+                                    f"[debug]   GT classes: {gt_labels[:min(5, len(gt_labels))].tolist()}"
+                                )
                                 unique_pred_classes = set(pred_labels.tolist())
                                 unique_gt_classes = set(gt_labels.tolist())
                                 overlap = len(unique_pred_classes & unique_gt_classes)
-                                print(f"[debug]   Class overlap: {overlap}/{len(unique_gt_classes)} GT classes predicted")
+                                print(
+                                    f"[debug]   Class overlap: "
+                                    f"{overlap}/{len(unique_gt_classes)} GT classes predicted"
+                                )
+
                         for j in range(len(gt_boxes)):
                             gt_box = gt_boxes[j].unsqueeze(0)
                             gt_label = gt_labels[j]
@@ -2088,39 +2459,39 @@ def _evaluate_detection(
                             ious = compute_iou(gt_box, candidate_boxes)[0]
                             if (ious >= iou_threshold).any():
                                 matched_gt_objects += 1
-                    
+
                     if valid_samples > 0:
                         loss = (total_cls_loss + total_bbox_loss) / valid_samples
                         val_loss += loss.item()
                         val_cls_loss += (total_cls_loss / valid_samples).item()
                         val_bbox_loss += (total_bbox_loss / valid_samples).item()
-            
-            avg_val_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 0.0
-            avg_val_cls_loss = val_cls_loss / len(val_loader) if len(val_loader) > 0 else 0.0
-            avg_val_bbox_loss = val_bbox_loss / len(val_loader) if len(val_loader) > 0 else 0.0
+                        val_samples += valid_samples
+
+            avg_val_loss = val_loss / max(val_samples, 1)
+            avg_val_cls_loss = val_cls_loss / max(val_samples, 1)
+            avg_val_bbox_loss = val_bbox_loss / max(val_samples, 1)
 
             iou_recall = float(matched_gt_objects) / float(total_gt_objects) if total_gt_objects > 0 else 0.0
-            
+
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
                 best_epoch = epoch
-            
-            # Compute current bbox weight for logging
+
             if epoch < bbox_loss_warmup_epochs:
                 warmup_factor = epoch / bbox_loss_warmup_epochs
                 current_bbox_weight = bbox_loss_weight + (bbox_loss_max_weight - bbox_loss_weight) * warmup_factor
             else:
                 current_bbox_weight = bbox_loss_weight
-            
-            # Step scheduler after each epoch
+
             if scheduler is not None:
                 scheduler.step()
-                current_lr = optimizer.param_groups[0]['lr']
+                current_lr = optimizer.param_groups[0]["lr"]
                 print(
                     f"Epoch {epoch+1}/{epochs} - "
                     f"train_loss={avg_train_loss:.4f} (cls={avg_train_cls_loss:.4f}, bbox={avg_train_bbox_loss:.4f}) "
                     f"val_loss={avg_val_loss:.4f} (cls={avg_val_cls_loss:.4f}, bbox={avg_val_bbox_loss:.4f}) "
-                    f"iou_recall@{iou_threshold:.2f}={iou_recall:.4f} lr={current_lr:.6f} bbox_w={current_bbox_weight:.1f}"
+                    f"iou_recall@{iou_threshold:.2f}={iou_recall:.4f} lr={current_lr:.6f} "
+                    f"bbox_w={current_bbox_weight:.1f}"
                 )
             else:
                 print(
@@ -2130,11 +2501,12 @@ def _evaluate_detection(
                     f"iou_recall@{iou_threshold:.2f}={iou_recall:.4f} bbox_w={current_bbox_weight:.1f}"
                 )
 
-            # Energy logging is handled by block tracker (every 10 epochs)
-            # No per-epoch logging here to match classification pipeline
+            if track_emissions and ((epoch + 1) % 10 == 0) and block_tracker is not None:
+                _stop_block_tracker(epoch + 1)
 
-            # Optionally save checkpoints every N epochs
-            if save_model and checkpoint_interval > 0 and ((epoch + 1) % checkpoint_interval == 0 or (epoch + 1) == epochs):
+            if save_model and checkpoint_interval > 0 and (
+                (epoch + 1) % checkpoint_interval == 0 or (epoch + 1) == epochs
+            ):
                 try:
                     ckpt_path = save_dir / f"epoch_{epoch+1:04d}.pt"
                     torch.save(
@@ -2210,7 +2582,7 @@ def _evaluate_detection(
                     writer.writerow(row)
         except Exception as exc:  # pragma: no cover - best-effort logging
             print(f"[warn] Failed to write detection CSV report to {report_path}: {exc}")
-
+    
     # Compute full COCO mAP@[.5:.95] if the dataset provides COCO API.
     coco_metrics: Dict[str, Any] = {}
     coco_gt = _get_coco_api_from_dataset(getattr(val_loader, "dataset", None))

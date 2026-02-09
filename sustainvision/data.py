@@ -57,6 +57,68 @@ COCO_CLASS_NAMES: list[str] = [
     'toothbrush'
 ]
 
+# Pascal VOC classes (20)
+VOC_CLASS_NAMES: list[str] = [
+    "aeroplane",
+    "bicycle",
+    "bird",
+    "boat",
+    "bottle",
+    "bus",
+    "car",
+    "cat",
+    "chair",
+    "cow",
+    "diningtable",
+    "dog",
+    "horse",
+    "motorbike",
+    "person",
+    "pottedplant",
+    "sheep",
+    "sofa",
+    "train",
+    "tvmonitor",
+]
+VOC_CLASS_TO_ID: dict[str, int] = {name: idx for idx, name in enumerate(VOC_CLASS_NAMES)}
+
+# Common aliases used in configs / external datasets for Pascal VOC.
+VOC_CLASS_ALIASES: dict[str, str] = {
+    "airplane": "aeroplane",
+    "motorcycle": "motorbike",
+    "bike": "bicycle",
+    "tv": "tvmonitor",
+    "tv_monitor": "tvmonitor",
+    "dining table": "diningtable",
+    "dining_table": "diningtable",
+    "potted plant": "pottedplant",
+    "potted_plant": "pottedplant",
+    "couch": "sofa",
+}
+
+# Default VOC subset that overlaps with CIFAR10/CIFAR100 concepts (10 classes).
+VOC_CIFAR10_SUBSET: list[str] = [
+    "aeroplane",
+    "bicycle",
+    "bird",
+    "car",
+    "cat",
+    "dog",
+    "horse",
+    "motorbike",
+    "person",
+    "train",
+]
+
+
+def resolve_voc_class_id(name: str) -> Optional[int]:
+    """Resolve VOC class id from a name, accepting common aliases."""
+    if not name:
+        return None
+    key = str(name).strip().lower()
+    key = VOC_CLASS_ALIASES.get(key, key)
+    return VOC_CLASS_TO_ID.get(key)
+
 # CIFAR-100 classes that overlap with COCO (semantic matches)
 # Maps CIFAR-100 class names to COCO class names
 CIFAR100_TO_COCO_MAPPING: dict[str, list[str]] = {
@@ -861,6 +923,8 @@ def build_detection_dataloaders(
     max_train_images: Optional[int] = None,
     max_val_images: Optional[int] = None,
     filter_classes: Optional[set[int]] = None,  # Set of COCO class indices [0..79] to keep
+    class_remap: Optional[dict[int, int]] = None,
+    resize_images: bool = True,
     normalize_images: bool = True,
 ) -> Tuple["DataLoader", "DataLoader", int]:  # type: ignore[name-defined]
     """Build dataloaders for object detection datasets (COCO, Pascal VOC, tiny synthetic).
@@ -920,7 +984,8 @@ def build_detection_dataloaders(
     def _to_tensor_and_normalize(img):
         from torchvision.transforms import functional as TF  # type: ignore
 
-        img = TF.resize(img, [image_size, image_size])
+        if resize_images:
+            img = TF.resize(img, [image_size, image_size])
         tensor = TF.to_tensor(img)
         # NOTE: torchvision detection models (Faster R-CNN / RetinaNet / etc.)
         # apply their own normalization inside GeneralizedRCNNTransform.
@@ -930,15 +995,24 @@ def build_detection_dataloaders(
             tensor = TF.normalize(tensor, mean=mean, std=std)
         return tensor
 
-    # Create class remapping if filtering is enabled
-    class_remap: Optional[dict[int, int]] = None
-    if filter_classes is not None and len(filter_classes) > 0:
-        # Create mapping from original COCO indices [0..79] to new contiguous indices [0..len(filter_classes)-1]
+    # Create class remapping if filtering is enabled and no explicit remap provided
+    class_remap_local: Optional[dict[int, int]] = class_remap
+    if class_remap_local is None and filter_classes is not None and len(filter_classes) > 0:
         sorted_classes = sorted(filter_classes)
-        class_remap = {old_idx: new_idx for new_idx, old_idx in enumerate(sorted_classes)}
-        print(f"[info] Filtering COCO classes: keeping {len(filter_classes)}/{len(COCO_CATEGORY_IDS)} classes")
-        print(f"[info]   Kept classes: {sorted_classes}")
-        print(f"[info]   Class names: {[COCO_CLASS_NAMES[i] for i in sorted_classes[:10]]}{'...' if len(sorted_classes) > 10 else ''}")
+        class_remap_local = {old_idx: new_idx for new_idx, old_idx in enumerate(sorted_classes)}
+
+    if filter_classes is not None and len(filter_classes) > 0:
+        if database_lower == "coco":
+            kept_classes = sorted(filter_classes)
+            print(f"[info] Filtering COCO classes: keeping {len(kept_classes)}/{len(COCO_CATEGORY_IDS)} classes")
+            print(f"[info]   Kept classes: {kept_classes}")
+            print(f"[info]   Class names: {[COCO_CLASS_NAMES[i] for i in kept_classes[:10]]}{'...' if len(kept_classes) > 10 else ''}")
+        elif database_lower in {"voc", "pascal_voc"}:
+            kept_classes = sorted(filter_classes)
+            kept_names = [VOC_CLASS_NAMES[i] for i in kept_classes if i < len(VOC_CLASS_NAMES)]
+            print(f"[info] Filtering VOC classes: keeping {len(kept_classes)}/20 classes")
+            print(f"[info]   Kept classes: {kept_classes}")
+            print(f"[info]   Class names: {kept_names}")
 
     def _parse_coco_annotations(annotations: list, orig_w: int, orig_h: int) -> Tuple["torch.Tensor", "torch.Tensor", int]:
         boxes: list[list[float]] = []
@@ -974,8 +1048,8 @@ def build_detection_dataloaders(
                 continue
             
             # Remap class index if filtering is enabled
-            if class_remap is not None:
-                mapped = class_remap[mapped]
+            if class_remap_local is not None:
+                mapped = class_remap_local[mapped]
 
             # Normalize to [0,1] in xyxy format relative to resized image_size
             # Scale boxes from original image coordinates to resized image coordinates
@@ -1003,7 +1077,11 @@ def build_detection_dataloaders(
             image_id,
         )
 
-    def _parse_voc_target(voc_target: dict, orig_w: int, orig_h: int) -> Tuple["torch.Tensor", "torch.Tensor", int]:
+    def _parse_voc_target(
+        voc_target: dict,
+        orig_w: int,
+        orig_h: int,
+    ) -> Tuple["torch.Tensor", "torch.Tensor", int]:
         boxes: list[list[float]] = []
         labels: list[int] = []
         image_id = -1
@@ -1016,6 +1094,12 @@ def build_detection_dataloaders(
                 for obj in objects:
                     if not isinstance(obj, dict):
                         continue
+                    try:
+                        difficult = int(obj.get("difficult", 0))
+                    except Exception:
+                        difficult = 0
+                    if difficult == 1:
+                        continue
                     bbox = obj.get("bndbox")
                     if not isinstance(bbox, dict):
                         continue
@@ -1027,8 +1111,13 @@ def build_detection_dataloaders(
                     except Exception:
                         continue
                     name = obj.get("name", "unknown")
-                    # Stable-ish mapping: keep it in [0..19]
-                    label = int(name) if isinstance(name, int) else (hash(str(name)) % 20)
+                    label = VOC_CLASS_TO_ID.get(str(name), None)
+                    if label is None:
+                        continue
+                    if filter_classes is not None and label not in filter_classes:
+                        continue
+                    if class_remap_local is not None:
+                        label = class_remap_local[label]
                     if orig_w > 0 and orig_h > 0:
                         # Scale boxes from original image coordinates to resized image coordinates
                         scale_x = image_size / orig_w
@@ -1207,7 +1296,7 @@ def build_detection_dataloaders(
         # COCO has 80 classes (1-90, but some IDs are skipped)
         # If filtering is enabled, use filtered class count
         if filter_classes is not None and len(filter_classes) > 0:
-            num_classes = len(filter_classes)
+            num_classes = len(class_remap_local or filter_classes)
         else:
             num_classes = 80
 
@@ -1226,6 +1315,32 @@ def build_detection_dataloaders(
                     "Please download it first using 'Download databases' menu."
                 )
 
+        def _is_voc_layout(path: Path) -> bool:
+            return (
+                (path / "Annotations").exists()
+                and (path / "JPEGImages").exists()
+                and (path / "ImageSets").exists()
+            )
+
+        standard_voc_root = voc_root / "VOCdevkit" / "VOC2012"
+        kaggle_voc_root = voc_root / "VOC2012_train_val" / "VOC2012_train_val"
+
+        if _is_voc_layout(voc_root):
+            kaggle_voc_root = voc_root
+
+        if standard_voc_root.exists():
+            voc_mode = "torchvision"
+            selected_root = standard_voc_root
+        elif kaggle_voc_root.exists():
+            voc_mode = "kaggle"
+            selected_root = kaggle_voc_root
+        else:
+            raise DatasetPreparationError(
+                "Pascal VOC dataset not found. Expected one of:\n"
+                f"  {standard_voc_root}\n"
+                f"  {kaggle_voc_root}"
+            )
+
         def _voc_transforms(img, target):
             orig_w, orig_h = img.size
             image_tensor = _to_tensor_and_normalize(img)
@@ -1237,33 +1352,151 @@ def build_detection_dataloaders(
                 "orig_size": torch.tensor([orig_h, orig_w], dtype=torch.int64),
             }
 
-        train_dataset = tv_datasets.VOCDetection(
-            root=str(voc_root),
-            year="2012",
-            image_set="train",
-            transforms=_voc_transforms,
-            download=False,
-        )
-
-        try:
-            val_dataset = tv_datasets.VOCDetection(
+        if voc_mode == "torchvision":
+            train_dataset = tv_datasets.VOCDetection(
                 root=str(voc_root),
                 year="2012",
-                image_set="val",
+                image_set="train",
                 transforms=_voc_transforms,
                 download=False,
             )
-        except Exception:
-            print("[warn] Pascal VOC validation set not found, using train set split")
-            from torch.utils.data import Subset
-            total = len(train_dataset)
-            val_count = max(1, int(total * 0.1))
-            indices = torch.randperm(total, generator=torch.Generator().manual_seed(seed))
-            val_dataset = Subset(train_dataset, indices[:val_count].tolist())
-            train_dataset = Subset(train_dataset, indices[val_count:].tolist())
 
-        # Pascal VOC has 20 classes
-        num_classes = 20
+            try:
+                val_dataset = tv_datasets.VOCDetection(
+                    root=str(voc_root),
+                    year="2012",
+                    image_set="val",
+                    transforms=_voc_transforms,
+                    download=False,
+                )
+            except Exception:
+                print("[warn] Pascal VOC validation set not found, using train set split")
+                from torch.utils.data import Subset
+                total = len(train_dataset)
+                val_count = max(1, int(total * 0.1))
+                indices = torch.randperm(total, generator=torch.Generator().manual_seed(seed))
+                val_dataset = Subset(train_dataset, indices[:val_count].tolist())
+                train_dataset = Subset(train_dataset, indices[val_count:].tolist())
+        else:
+            import xml.etree.ElementTree as ET
+
+            class VOCXmlDetectionDataset(torch.utils.data.Dataset):  # type: ignore[attr-defined]
+                def __init__(self, base_root: Path, split: str):
+                    self.base_root = base_root
+                    self.image_dir = base_root / "JPEGImages"
+                    self.ann_dir = base_root / "Annotations"
+                    split_file = base_root / "ImageSets" / "Main" / f"{split}.txt"
+                    if not split_file.exists():
+                        raise DatasetPreparationError(
+                            f"VOC split file not found: {split_file}"
+                        )
+                    self.image_ids = [
+                        line.strip() for line in split_file.read_text(encoding="utf-8").splitlines()
+                        if line.strip()
+                    ]
+
+                def __len__(self) -> int:
+                    return len(self.image_ids)
+
+                def __getitem__(self, idx: int):
+                    image_id = self.image_ids[idx]
+                    img_path = self.image_dir / f"{image_id}.jpg"
+                    ann_path = self.ann_dir / f"{image_id}.xml"
+
+                    from PIL import Image
+
+                    img = Image.open(img_path).convert("RGB")
+                    orig_w, orig_h = img.size
+                    image_tensor = _to_tensor_and_normalize(img)
+
+                    boxes: list[list[float]] = []
+                    labels: list[int] = []
+                    try:
+                        tree = ET.parse(ann_path)
+                        root_node = tree.getroot()
+                    except Exception:
+                        root_node = None
+
+                    if root_node is not None:
+                        for obj in root_node.findall("object"):
+                            name_node = obj.find("name")
+                            name = name_node.text if name_node is not None else "unknown"
+                            label = VOC_CLASS_TO_ID.get(str(name), None)
+                            if label is None:
+                                continue
+                            if filter_classes is not None and label not in filter_classes:
+                                continue
+                            if class_remap_local is not None:
+                                label = class_remap_local[label]
+                            diff_node = obj.find("difficult")
+                            if diff_node is not None and diff_node.text == "1":
+                                continue
+                            bbox = obj.find("bndbox")
+                            if bbox is None:
+                                continue
+                            try:
+                                x1 = float(bbox.find("xmin").text)
+                                y1 = float(bbox.find("ymin").text)
+                                x2 = float(bbox.find("xmax").text)
+                                y2 = float(bbox.find("ymax").text)
+                            except Exception:
+                                continue
+                            if orig_w > 0 and orig_h > 0:
+                                scale_x = image_size / orig_w
+                                scale_y = image_size / orig_h
+                                boxes.append([
+                                    (x1 * scale_x) / image_size,
+                                    (y1 * scale_y) / image_size,
+                                    (x2 * scale_x) / image_size,
+                                    (y2 * scale_y) / image_size,
+                                ])
+                                labels.append(int(label))
+
+                    if boxes:
+                        boxes_t = torch.tensor(boxes, dtype=torch.float32)
+                        labels_t = torch.tensor(labels, dtype=torch.long)
+                    else:
+                        boxes_t = torch.zeros((0, 4), dtype=torch.float32)
+                        labels_t = torch.zeros((0,), dtype=torch.long)
+
+                    return image_tensor, {
+                        "boxes": boxes_t,
+                        "labels": labels_t,
+                        "image_id": int(idx),
+                        "orig_size": torch.tensor([orig_h, orig_w], dtype=torch.int64),
+                    }
+
+            train_dataset = VOCXmlDetectionDataset(selected_root, "train")
+            val_dataset = VOCXmlDetectionDataset(selected_root, "val")
+
+        # Optional: limit dataset size for quick tests
+        if max_train_images is not None:
+            try:
+                max_train_images_int = max(1, int(max_train_images))
+                if len(train_dataset) > max_train_images_int:
+                    from torch.utils.data import Subset
+
+                    train_dataset = Subset(train_dataset, list(range(max_train_images_int)))
+                    print(f"[info] Limiting VOC train to {max_train_images_int} images (quick test).")
+            except Exception:
+                pass
+
+        if max_val_images is not None:
+            try:
+                max_val_images_int = max(1, int(max_val_images))
+                if len(val_dataset) > max_val_images_int:
+                    from torch.utils.data import Subset
+
+                    val_dataset = Subset(val_dataset, list(range(max_val_images_int)))
+                    print(f"[info] Limiting VOC val to {max_val_images_int} images (quick test).")
+            except Exception:
+                pass
+
+        # Pascal VOC has 20 classes (or a filtered subset)
+        if filter_classes is not None and len(filter_classes) > 0:
+            num_classes = len(class_remap_local or filter_classes)
+        else:
+            num_classes = 20
 
     else:
         raise DatasetPreparationError(
@@ -1317,7 +1550,7 @@ def _collate_detection_batch(batch: list) -> Tuple["torch.Tensor", list]:  # typ
         if isinstance(target, dict) and "boxes" in target and "labels" in target:
             targets.append(target)
             continue
-
+        
         boxes = []
         labels = []
 
@@ -1376,7 +1609,18 @@ def _collate_detection_batch(batch: list) -> Tuple["torch.Tensor", list]:  # typ
             }
         targets.append(target_tensor)
 
-    images = torch.stack(images)
+    # If all images are the same size, stack into a tensor for efficiency.
+    # Otherwise, keep as list (torchvision detection models accept list inputs).
+    same_size = True
+    if images:
+        first_shape = tuple(images[0].shape)
+        for img in images[1:]:
+            if tuple(img.shape) != first_shape:
+                same_size = False
+                break
+
+    if same_size:
+        images = torch.stack(images)
     return images, targets
 
 
