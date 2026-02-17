@@ -1353,13 +1353,21 @@ def build_detection_dataloaders(
             }
 
         if voc_mode == "torchvision":
-            train_dataset = tv_datasets.VOCDetection(
-                root=str(voc_root),
-                year="2012",
-                image_set="train",
-                transforms=_voc_transforms,
-                download=False,
-            )
+            train_dataset = None
+            val_dataset = None
+            try:
+                train_dataset = tv_datasets.VOCDetection(
+                    root=str(voc_root),
+                    year="2012",
+                    image_set="train",
+                    transforms=_voc_transforms,
+                    download=False,
+                )
+            except Exception as exc:
+                raise DatasetPreparationError(
+                    "Pascal VOC dataset not found or corrupted for split='train'. "
+                    f"Expected a torchvision VOC layout under: {voc_root}"
+                ) from exc
 
             try:
                 val_dataset = tv_datasets.VOCDetection(
@@ -1372,9 +1380,12 @@ def build_detection_dataloaders(
             except Exception:
                 print("[warn] Pascal VOC validation set not found, using train set split")
                 from torch.utils.data import Subset
+
                 total = len(train_dataset)
                 val_count = max(1, int(total * 0.1))
-                indices = torch.randperm(total, generator=torch.Generator().manual_seed(seed))
+                indices = torch.randperm(
+                    total, generator=torch.Generator().manual_seed(seed)
+                )
                 val_dataset = Subset(train_dataset, indices[:val_count].tolist())
                 train_dataset = Subset(train_dataset, indices[val_count:].tolist())
         else:
