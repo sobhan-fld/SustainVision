@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to VOC root (VOCdevkit or Kaggle VOC2012 layout)",
     )
     parser.add_argument("--epochs", type=int, default=12)
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument(
         "--lr",
@@ -274,8 +274,27 @@ def build_model(
             "timm is required for this script. Install it with `pip install timm`."
         )
 
-    # Load SupCon-pretrained ResNet34 from timm/HuggingFace.
-    body = timm.create_model(hf_backbone, pretrained=True)
+    # This Hugging Face checkpoint registers its timm models via the `detectors` package.
+    # The model card recommends:
+    #   import detectors
+    #   timm.create_model("resnet34_supcon_cifar100", pretrained=True)
+    try:
+        import detectors  # type: ignore  # noqa: F401
+    except Exception:
+        # If the model name is a standard timm model, it may still work without `detectors`.
+        # But for `*_supcon_cifar100` models from edadaltocg, `detectors` is typically required.
+        pass
+
+    # Load SupCon-pretrained ResNet34 from timm/HuggingFace (via detectors registry).
+    try:
+        body = timm.create_model(hf_backbone, pretrained=True)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to create timm model '{hf_backbone}'. "
+            "For edadaltocg SupCon models you likely need the `detectors` package:\n"
+            "  pip install detectors\n"
+            "Then rerun the script."
+        ) from exc
     body.eval()
 
     # Wrap with FPN using standard ResNet channel sizes.

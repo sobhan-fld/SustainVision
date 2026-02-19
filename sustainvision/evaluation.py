@@ -26,9 +26,17 @@ except Exception:
 try:  # pragma: no cover - optional dependency
     from torchvision.models.detection import FasterRCNN  # type: ignore[attr-defined]
     from torchvision.models.detection.backbone_utils import resnet_fpn_backbone  # type: ignore[attr-defined]
+    from torchvision.models.detection.rpn import AnchorGenerator  # type: ignore[attr-defined]
+    from torchvision.ops import MultiScaleRoIAlign  # type: ignore[attr-defined]
+    from torchvision.models._utils import IntermediateLayerGetter  # type: ignore[attr-defined]
+    from torchvision import models as tv_models  # type: ignore[attr-defined]
 except Exception:  # pragma: no cover - runtime safeguard
     FasterRCNN = None  # type: ignore
     resnet_fpn_backbone = None  # type: ignore
+    AnchorGenerator = None  # type: ignore
+    MultiScaleRoIAlign = None  # type: ignore
+    IntermediateLayerGetter = None  # type: ignore
+    tv_models = None  # type: ignore
 
 from .config import TrainingConfig
 from .models import build_model
@@ -1067,12 +1075,13 @@ def evaluate_with_head(
         raise RuntimeError("PyTorch is required for evaluation")
 
     # Special-case: use torchvision's Faster R-CNN style detector with ResNet18+FPN.
-    if head_type == "torchvision_frcnn":
+    if head_type in {"torchvision_frcnn", "torchvision_rcnn"}:
         return _evaluate_torchvision_frcnn(
             config=config,
             checkpoint_path=checkpoint_path,
             project_root=project_root,
             report_path=report_path,
+            detector_variant=head_type,
         )
     
     device_str = config.device
@@ -1243,8 +1252,13 @@ def _evaluate_torchvision_frcnn(
     checkpoint_path: Optional[Union[str, Path]] = None,
     project_root: Optional[Path] = None,
     report_path: Optional[Path] = None,
+    detector_variant: str = "torchvision_frcnn",
 ) -> Dict[str, Any]:
-    """Train/evaluate a torchvision Faster R-CNN style detector with ResNet-18+FPN on COCO.
+    """Train/evaluate a torchvision detector on COCO/VOC.
+
+    Supported variants:
+    - `torchvision_frcnn`: Faster R-CNN with ResNet18+FPN backbone.
+    - `torchvision_rcnn`: Faster R-CNN with a single C4 feature map (no FPN).
 
     This uses torchvision's detection model plus SustainVision's dataloaders,
     reporting, and CodeCarbon integration so we can compare emissions and accuracy
@@ -1255,9 +1269,13 @@ def _evaluate_torchvision_frcnn(
         or DataLoader is None
         or FasterRCNN is None
         or resnet_fpn_backbone is None
+        or AnchorGenerator is None
+        or MultiScaleRoIAlign is None
+        or IntermediateLayerGetter is None
+        or tv_models is None
     ):
         raise RuntimeError(
-            "PyTorch + torchvision detection are required for head_type='torchvision_frcnn'. "
+            "PyTorch + torchvision detection are required for head_type in {'torchvision_frcnn','torchvision_rcnn'}. "
             "Install torchvision with detection modules."
         )
 
@@ -1335,8 +1353,36 @@ def _evaluate_torchvision_frcnn(
     num_classes = dataset_num_classes  # contiguous [0..C-1]
     num_classes_with_bg = num_classes + 1  # torchvision detectors include background
 
-    print("[info] Building torchvision Faster R-CNN (ResNet-18 + FPN) detector")
-    backbone = resnet_fpn_backbone("resnet18", pretrained=False, trainable_layers=5)  # type: ignore[call-arg]
+    if detector_variant == "torchvision_frcnn":
+        print("[info] Building torchvision Faster R-CNN (ResNet-18 + FPN) detector")
+        backbone = resnet_fpn_backbone("resnet18", pretrained=False, trainable_layers=5)  # type: ignore[call-arg]
+        resnet_body_for_loading = backbone.body
+        box_roi_pool = None
+        rpn_anchor_generator = None
+    elif detector_variant == "torchvision_rcnn":
+        print("[info] Building torchvision R-CNN style detector (ResNet-18 C4, no FPN)")
+        resnet18 = tv_models.resnet18(weights=None)
+        # Keep standard stem (stride-2 + maxpool) for detection memory/geometry.
+        resnet18.fc = nn.Identity()  # type: ignore[assignment]
+
+        # Wrap resnet to expose only layer4 as a single feature map named "0".
+        backbone = IntermediateLayerGetter(resnet18, return_layers={"layer4": "0"})  # type: ignore[call-arg]
+        backbone.out_channels = 512  # type: ignore[attr-defined]
+        resnet_body_for_loading = resnet18
+
+        # Single feature map → single-scale anchor generator + single-feature ROIAlign.
+        # (Keeps the rest of Faster R-CNN unchanged.)
+        rpn_anchor_generator = AnchorGenerator(
+            sizes=((32, 64, 128, 256, 512),),
+            aspect_ratios=((0.5, 1.0, 2.0),),
+        )
+        box_roi_pool = MultiScaleRoIAlign(
+            featmap_names=["0"],
+            output_size=7,
+            sampling_ratio=2,
+        )
+    else:
+        raise ValueError(f"Unsupported detector_variant: {detector_variant}")
 
     if checkpoint_path is not None:
         checkpoint_path = Path(checkpoint_path)
@@ -1358,7 +1404,7 @@ def _evaluate_torchvision_frcnn(
                 projection_hidden_dim=config.hyperparameters.get("projection_hidden_dim"),
                 projection_use_bn=config.hyperparameters.get("projection_use_bn", False),
             )
-            missing, unexpected = backbone.body.load_state_dict(
+            missing, unexpected = resnet_body_for_loading.load_state_dict(
                 supcon_backbone.state_dict(),
                 strict=False,
             )
@@ -1369,7 +1415,15 @@ def _evaluate_torchvision_frcnn(
         except Exception as exc:
             print(f"[warn] Failed to load backbone weights: {exc}")
 
-    model = FasterRCNN(backbone, num_classes=num_classes_with_bg)  # type: ignore[call-arg]
+    if detector_variant == "torchvision_frcnn":
+        model = FasterRCNN(backbone, num_classes=num_classes_with_bg)  # type: ignore[call-arg]
+    else:
+        model = FasterRCNN(  # type: ignore[call-arg]
+            backbone,
+            num_classes=num_classes_with_bg,
+            rpn_anchor_generator=rpn_anchor_generator,
+            box_roi_pool=box_roi_pool,
+        )
 
     model.to(device)
 
