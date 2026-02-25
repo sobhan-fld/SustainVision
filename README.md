@@ -424,6 +424,214 @@ This modular structure makes it easy to:
 - Extend functionality (e.g., add new loss functions or optimizers)
 - Maintain and debug the codebase
 
+Developer Guide (Architecture & File Map)
+-----------------------------------------
+
+This section is intended for contributors who want to understand how the codebase
+is organized and where to implement changes safely.
+
+### Core design principles
+
+- **Config-driven orchestration**: Most workflows are controlled by `TrainingConfig`
+  values loaded through `ConfigManager`, so new features should prefer config flags
+  over hard-coded branches.
+- **Separation of concerns**: Data loading, model building, optimization, metrics,
+  and orchestration are split into dedicated modules.
+- **Optional dependency resilience**: Many modules support partial functionality when
+  `torch`, `torchvision`, `codecarbon`, or other optional packages are unavailable.
+- **Evaluation as a dispatcher**: `sustainvision/evaluation.py` routes to task-specific
+  evaluation loops while preserving a stable public entrypoint.
+- **Artifact-first experimentation**: Training/evaluation paths are expected to save
+  enough metadata (config, CSV metrics, checkpoints, emissions data) to reproduce runs.
+
+### Repository map (top level)
+
+- `main.py`
+  - Interactive entrypoint (Questionary menu).
+  - Dispatches to training, evaluation, config editing, dataset download, and device inspection.
+- `configs/`
+  - YAML experiment configurations. Prefer adding reproducible runs here.
+- `scripts/`
+  - Non-interactive helpers (e.g., run with config, dataset download utilities).
+- `sustainvision/`
+  - Main package with config, training, evaluation, detection, and utility modules.
+- `objectdetection/`
+  - Legacy/standalone baseline experiments (research scripts, not the main orchestrated pipeline).
+- `databases/`
+  - Local dataset storage (git-ignored except `.gitkeep`).
+- `outputs*/`, `output_*`
+  - Experiment artifacts and historical runs (checkpoints, CSVs, logs).
+
+### Python package file-by-file (`sustainvision/`)
+
+- `config.py`
+  - Defines `TrainingConfig` and `ConfigManager`.
+  - Handles YAML load/save, default merging, and config-path resolution.
+  - This is the main compatibility surface for new config options.
+- `tui.py`
+  - Interactive config editor built with `questionary`.
+  - Converts user prompts into config updates and persists them via `ConfigManager`.
+- `utils.py`
+  - Shared utilities: device resolution, random seeding, report-path helpers.
+- `types.py`
+  - Shared typed containers/dataclasses for training/evaluation summaries and metrics.
+- `data.py`
+  - Dataset downloading and loader construction (classification + detection).
+  - Contains dataset parsing/normalization/box conversion logic and custom collate functions.
+  - Detection dataloaders return `(images, targets)` with standardized target dicts.
+- `samplers.py`
+  - `MPerClassSampler` used by SupCon workflows to guarantee positives per batch.
+- `models.py`
+  - Backbone + classifier/projector construction (ResNet, MobileNet, EfficientNet, ViT, fallback MLP).
+  - Shared by contrastive/supervised training.
+- `losses.py`
+  - Standard supervised losses plus SimCLR/SupCon implementations and dispatch helpers.
+- `optimizers.py`
+  - Optimizer builders (Adam/SGD/etc.) and scheduler construction (step/cosine/warmup).
+- `reporting.py`
+  - CSV reporting helpers for training metrics and run summaries.
+- `training.py`
+  - Main training loop implementation for classification/contrastive workflows.
+  - Handles checkpoints, CodeCarbon tracking, quantization export, and resource-energy logging.
+- `schedule.py`
+  - Alternating contrastive pretrain/finetune schedule orchestration.
+  - Reuses `training.py` phases with explicit state handoff.
+- `evaluation.py`
+  - Public evaluation entrypoint (`evaluate_with_head`).
+  - Classification evaluation implementation plus dispatch wrappers to detection modules.
+  - Kept intentionally thin after the detection refactor.
+- `detection_models.py`
+  - Detection backbones/heads/factories and pretrained-backbone loading helpers.
+  - Includes torchvision detector builders and the shared `MultiHeadModel`/`DetectionHead`.
+- `detection_metrics.py`
+  - IoU, NMS, COCO/VOC metrics, prediction conversion helpers.
+  - Used by multiple detection loops to avoid duplicated metric code.
+- `detection_train.py`
+  - Detection training/evaluation loop implementations (slot-based and torchvision detector paths).
+  - Includes CodeCarbon + `tqdm` integration, CSV/checkpoint saving, and resource logging.
+- `rcnn_classic.py`
+  - Experimental classic R-CNN-style pipeline:
+    - proposal generation
+    - ROI crops via `roi_align`
+    - backbone feature extraction on ROI patches
+    - per-ROI classification + box regression
+  - Designed for feature-space probing / experimentation, not as a production detector.
+
+### How the main execution paths fit together
+
+- **Training path**:
+  - `main.py` -> `ConfigManager.load()` -> `train_model()` (`training.py`)
+  - Optional contrastive schedule -> `schedule.py`
+  - Uses `data.py`, `models.py`, `losses.py`, `optimizers.py`, `reporting.py`
+- **Evaluation path**:
+  - `main.py` -> `evaluate_with_head()` (`evaluation.py`)
+  - `classification` head stays in `evaluation.py`
+  - detection heads dispatch to:
+    - `detection_train.py` (slot / torchvision detectors)
+    - `rcnn_classic.py` (experimental classic R-CNN path)
+  - Detection modules reuse `detection_models.py`, `detection_metrics.py`, and `data.py`
+
+### Contributor tips (where to change what)
+
+- Add a new config option:
+  - `sustainvision/config.py` (defaults + serialization)
+  - `sustainvision/tui.py` (prompt, if user-facing)
+  - relevant consumer module (`training.py`, `detection_train.py`, `rcnn_classic.py`, etc.)
+- Add a new detection metric:
+  - implement in `sustainvision/detection_metrics.py`
+  - wire into `detection_train.py` and/or `rcnn_classic.py`
+- Add a new detection model variant:
+  - factory/build logic in `sustainvision/detection_models.py`
+  - evaluation dispatch in `sustainvision/evaluation.py`
+  - training loop integration in `sustainvision/detection_train.py`
+- Add a new experiment:
+  - create a YAML in `configs/`
+  - ensure `save_model_path` / `report_filename` are unique and meaningful
+
+Latest Changes: `rcnn_classic` Fixes & Improvements
+---------------------------------------------------
+
+The `rcnn_classic` path received a substantial quality-of-life and reliability
+upgrade. These changes are especially relevant if you use it to probe frozen
+feature spaces (e.g., SupCon-pretrained CIFAR backbones transferred to VOC).
+
+### What was fixed
+
+- **Variable-size detection batch crash fixed**
+  - The classic R-CNN loop previously assumed `images` was a single stacked tensor.
+  - Detection dataloaders may return a list when image sizes differ.
+  - The classic path now requests fixed-size resized images from `data.py`, which keeps
+    ROI-align inputs batched and consistent.
+
+- **`tqdm` progress bars added**
+  - Train/validation loops now use `tqdm` when available (and fall back gracefully if not installed).
+
+- **CodeCarbon support added to `rcnn_classic`**
+  - Emissions and energy consumption are now tracked (best effort, optional dependency).
+  - Values are returned in evaluation results and can be persisted in artifacts.
+
+- **Artifact saving added (matching other detection loops)**
+  - Config snapshot (`config.yaml`)
+  - Checkpoints (`epoch_XXXX.pt`, `best_model.pt`)
+  - Final results (`results.json`, `results.yaml`)
+  - Per-epoch metrics CSV (`detection_metrics.csv`)
+  - Resource/energy snapshot CSV (`resource_energy_log.csv`)
+  - Final validation predictions and GT dumps for debugging metric mismatches
+
+- **Finish date/time recorded in CSV**
+  - `detection_metrics.csv` now includes a summary row with finish timestamps
+    (ISO timestamp and local date/time string).
+
+- **CIFAR-pretrained ResNet stem compatibility improved**
+  - Added `hyperparameters.backbone_image_size` for `rcnn_classic`.
+  - This is important when loading CIFAR-trained checkpoints (e.g., SupCon ResNet18)
+    so the backbone stem shape matches and `conv1` weights do not get skipped.
+
+- **Selective-search proposal generation with on-disk caching**
+  - New proposal method for `rcnn_classic`:
+    - `evaluation.rcnn_classic_proposal_method: selective_search`
+  - Proposals can be cached to disk and reused across epochs/reruns, making later runs faster.
+  - If OpenCV selective search is unavailable, the code falls back to grid proposals with a warning.
+
+### New/important `rcnn_classic` config knobs
+
+Example (feature-space probe, frozen backbone):
+
+```yaml
+evaluation:
+  head_type: rcnn_classic
+  freeze_backbone: true
+  rcnn_classic_proposal_method: selective_search
+  rcnn_classic_cache_proposals: true
+  rcnn_classic_selective_search_mode: fast
+  rcnn_classic_selective_search_min_box_size: 8
+  rcnn_classic_max_grid_proposals: 256  # also used as proposal cap for selective search
+
+hyperparameters:
+  backbone_image_size: 32  # for CIFAR-trained ResNet stems
+  checkpoint_interval: 6
+  track_emissions: true
+```
+
+### Performance notes (important)
+
+- The **first epoch is slower** when proposal caching is enabled because selective-search
+  proposals are computed and written to disk.
+- **Later epochs and reruns are faster** because cached proposal tensors are loaded.
+- `rcnn_classic_max_grid_proposals` currently acts as the **proposal cap** for both grid
+  proposals and selective-search proposals (the name is legacy).
+- If GPU memory is tight, reduce:
+  - `hyperparameters.batch_size`
+  - `evaluation.rcnn_classic_max_grid_proposals`
+  - `evaluation.rcnn_classic_roi_size`
+
+### Limitations (current experimental status)
+
+- `rcnn_classic` remains an **experimental feature-space probing path**, not a production detector.
+- Lower validation loss does **not** necessarily imply good `map50`; AP depends on proposal
+  recall, class confidence ranking, and IoU quality at inference time.
+- For strong detection baselines, prefer `torchvision_frcnn` or `torchvision_rcnn`.
+
 Dependencies Overview
 ---------------------
 
