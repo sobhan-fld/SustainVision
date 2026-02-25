@@ -219,6 +219,59 @@ evaluation:
   hidden_dim: 256
 ```
 
+Detection Variants (Evaluation Mode)
+------------------------------------
+
+Set `evaluation.enabled: true` and choose one of these `evaluation.head_type` values:
+
+- `detection`: SustainVision slot-based detection head (lightweight representation evaluation)
+- `torchvision_frcnn`: torchvision Faster R-CNN with ResNet18 + FPN
+- `torchvision_rcnn`: Faster R-CNN using a single C4 feature map (R-CNN-like)
+- `rcnn_classic`: experimental classic R-CNN style pipeline (grid proposals + ROI crops)
+
+Example snippets:
+
+```yaml
+evaluation:
+  enabled: true
+  checkpoint_path: outputs/your_checkpoint.pt
+  head_type: detection
+  num_anchors: 9
+  hidden_dim: 256
+```
+
+```yaml
+evaluation:
+  enabled: true
+  checkpoint_path: outputs/your_checkpoint.pt
+  head_type: torchvision_frcnn
+  nms_threshold: 0.5
+```
+
+```yaml
+evaluation:
+  enabled: true
+  checkpoint_path: outputs/your_checkpoint.pt
+  head_type: torchvision_rcnn
+  nms_threshold: 0.5
+```
+
+```yaml
+evaluation:
+  enabled: true
+  checkpoint_path: outputs/your_checkpoint.pt
+  head_type: rcnn_classic
+  freeze_backbone: true
+  hidden_dim: 256
+  rcnn_classic_roi_size: 96
+  rcnn_classic_max_grid_proposals: 96
+```
+
+Expected detection dataset layouts:
+
+- COCO: `databases/coco/images/train2017`, `databases/coco/images/val2017`, `databases/coco/annotations/*.json`
+- Pascal VOC: torchvision layout `databases/voc/VOCdevkit/VOC2012/...` or XML/Kaggle-style `Annotations/`, `JPEGImages/`, `ImageSets/`
+
 This allows you to train the feature space once and evaluate it on multiple downstream
 tasks, demonstrating the transferability of learned representations.
 
@@ -423,4 +476,3 @@ License
 -------
 
 Released under the MIT License. See the `LICENSE` file for details.
-

@@ -460,6 +460,7 @@ def _execute_training_phase(
             subset_seed=subset_seed,
             use_m_per_class_sampler=use_m_per_class_sampler,
             m_per_class=m_per_class,
+            pin_memory=(device.type == "cuda"),
         )
     except DatasetPreparationError as exc:
         raise MissingDependencyError(str(exc)) from exc
@@ -1052,4 +1053,3 @@ def _execute_training_phase(
         "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
         "total_t_max": final_total_t_max,
     }
-

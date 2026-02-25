@@ -130,7 +130,7 @@ class TrainingConfig:
         default_factory=lambda: {
             "enabled": False,
             "checkpoint_path": None,
-            "head_type": "classification",  # "classification" or "detection"
+            "head_type": "classification",  # "classification", "detection", "torchvision_frcnn", "torchvision_rcnn", "rcnn_classic"
             "num_anchors": 9,  # For detection head
             "hidden_dim": 256,  # For detection head
             # Detection-eval extras
@@ -331,5 +331,4 @@ class ConfigManager:
         if hyperparameters is not None:
             # Update (not replace) to preserve non-provided keys
             self._config.hyperparameters.update(hyperparameters)
-
 

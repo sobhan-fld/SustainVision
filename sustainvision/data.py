@@ -400,6 +400,7 @@ def build_classification_dataloaders(
     subset_seed: Optional[int] = None,
     use_m_per_class_sampler: bool = False,
     m_per_class: Optional[int] = None,
+    pin_memory: Optional[bool] = None,
 ) -> Tuple["DataLoader", "DataLoader", int]:  # type: ignore[name-defined]
     """Create train/val dataloaders for common classification datasets."""
 
@@ -420,6 +421,7 @@ def build_classification_dataloaders(
     val_split = max(0.0, min(float(val_split), 0.5))
     num_workers = max(0, int(num_workers))
     image_size = max(32, int(image_size))
+    use_pin_memory = bool(pin_memory) if pin_memory is not None else True
     subset_value: Optional[int] = None
     if subset_per_class is not None:
         try:
@@ -893,7 +895,7 @@ def build_classification_dataloaders(
         sampler=train_sampler,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=use_pin_memory,
         drop_last=contrastive,
         prefetch_factor=2 if num_workers > 0 else None,  # Prefetch batches for faster GPU utilization
         persistent_workers=num_workers > 0,  # Keep workers alive between epochs
@@ -903,7 +905,7 @@ def build_classification_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=use_pin_memory,
         prefetch_factor=2 if num_workers > 0 else None,
         persistent_workers=num_workers > 0,
     )
@@ -926,6 +928,8 @@ def build_detection_dataloaders(
     class_remap: Optional[dict[int, int]] = None,
     resize_images: bool = True,
     normalize_images: bool = True,
+    box_coordinate_format: str = "normalized",
+    pin_memory: Optional[bool] = None,
 ) -> Tuple["DataLoader", "DataLoader", int]:  # type: ignore[name-defined]
     """Build dataloaders for object detection datasets (COCO, Pascal VOC, tiny synthetic).
     
@@ -933,6 +937,8 @@ def build_detection_dataloaders(
     - 'boxes': [N, 4] tensor of bounding boxes in (x1, y1, x2, y2) format
     - 'labels': [N] tensor of class labels
     - 'image_id': image identifier
+    - Box coordinates are either normalized [0,1] or pixel-space depending on
+      `box_coordinate_format`.
     
     Parameters
     ----------
@@ -950,6 +956,9 @@ def build_detection_dataloaders(
         Project root directory
     image_size:
         Target image size for resizing
+    box_coordinate_format:
+        "normalized" for slot-based detection heads, "pixel" for torchvision /
+        ROI-crop detectors that expect pixel-space targets.
         
     Returns
     -------
@@ -972,6 +981,13 @@ def build_detection_dataloaders(
     # Normalize image size
     image_size = max(32, int(image_size))
     num_workers = max(0, int(num_workers))
+    use_pin_memory = bool(pin_memory) if pin_memory is not None else True
+    box_coordinate_format = str(box_coordinate_format or "normalized").strip().lower()
+    if box_coordinate_format not in {"normalized", "pixel"}:
+        raise DatasetPreparationError(
+            f"Unsupported box_coordinate_format={box_coordinate_format!r}. "
+            "Use 'normalized' or 'pixel'."
+        )
 
     # Define transforms for detection datasets.
     # IMPORTANT: detection targets (boxes) must be consistent with the transformed image.
@@ -1014,6 +1030,35 @@ def build_detection_dataloaders(
             print(f"[info]   Kept classes: {kept_classes}")
             print(f"[info]   Class names: {kept_names}")
 
+    def _convert_box_coords(
+        x1: float,
+        y1: float,
+        x2: float,
+        y2: float,
+        *,
+        orig_w: int,
+        orig_h: int,
+    ) -> Optional[list[float]]:
+        if orig_w <= 0 or orig_h <= 0:
+            return None
+        if box_coordinate_format == "normalized":
+            return [
+                x1 / float(orig_w),
+                y1 / float(orig_h),
+                x2 / float(orig_w),
+                y2 / float(orig_h),
+            ]
+        if resize_images:
+            scale_x = image_size / float(orig_w)
+            scale_y = image_size / float(orig_h)
+            return [
+                x1 * scale_x,
+                y1 * scale_y,
+                x2 * scale_x,
+                y2 * scale_y,
+            ]
+        return [x1, y1, x2, y2]
+
     def _parse_coco_annotations(annotations: list, orig_w: int, orig_h: int) -> Tuple["torch.Tensor", "torch.Tensor", int]:
         boxes: list[list[float]] = []
         labels: list[int] = []
@@ -1051,18 +1096,9 @@ def build_detection_dataloaders(
             if class_remap_local is not None:
                 mapped = class_remap_local[mapped]
 
-            # Normalize to [0,1] in xyxy format relative to resized image_size
-            # Scale boxes from original image coordinates to resized image coordinates
-            if orig_w > 0 and orig_h > 0:
-                scale_x = image_size / orig_w
-                scale_y = image_size / orig_h
-                # Scale boxes to resized image coordinates, then normalize to [0,1]
-                boxes.append([
-                    (x1 * scale_x) / image_size,
-                    (y1 * scale_y) / image_size,
-                    (x2 * scale_x) / image_size,
-                    (y2 * scale_y) / image_size,
-                ])
+            converted = _convert_box_coords(x1, y1, x2, y2, orig_w=orig_w, orig_h=orig_h)
+            if converted is not None:
+                boxes.append(converted)
                 labels.append(int(mapped))
 
         if boxes:
@@ -1118,17 +1154,9 @@ def build_detection_dataloaders(
                         continue
                     if class_remap_local is not None:
                         label = class_remap_local[label]
-                    if orig_w > 0 and orig_h > 0:
-                        # Scale boxes from original image coordinates to resized image coordinates
-                        scale_x = image_size / orig_w
-                        scale_y = image_size / orig_h
-                        # Scale boxes to resized image coordinates, then normalize to [0,1]
-                        boxes.append([
-                            (x1 * scale_x) / image_size,
-                            (y1 * scale_y) / image_size,
-                            (x2 * scale_x) / image_size,
-                            (y2 * scale_y) / image_size,
-                        ])
+                    converted = _convert_box_coords(x1, y1, x2, y2, orig_w=orig_w, orig_h=orig_h)
+                    if converted is not None:
+                        boxes.append(converted)
                         labels.append(label)
         if boxes:
             return (
@@ -1179,8 +1207,11 @@ def build_detection_dataloaders(
                     label = int(torch.randint(0, num_classes, (1,), generator=self.generator).item())
                     labels.append(label)
 
+                boxes_t = torch.tensor(boxes, dtype=torch.float32)
+                if box_coordinate_format == "normalized":
+                    boxes_t = boxes_t / float(self.image_size)
                 target = {
-                    "boxes": torch.tensor(boxes, dtype=torch.float32),
+                    "boxes": boxes_t,
                     "labels": torch.tensor(labels, dtype=torch.long),
                 }
                 return img, target
@@ -1194,7 +1225,7 @@ def build_detection_dataloaders(
             batch_size=batch_size,
             shuffle=True,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=use_pin_memory,
             collate_fn=_collate_detection_batch,
             prefetch_factor=2 if num_workers > 0 else None,
             persistent_workers=num_workers > 0,
@@ -1204,7 +1235,7 @@ def build_detection_dataloaders(
             batch_size=batch_size,
             shuffle=False,
             num_workers=num_workers,
-            pin_memory=True,
+            pin_memory=use_pin_memory,
             collate_fn=_collate_detection_batch,
             prefetch_factor=2 if num_workers > 0 else None,
             persistent_workers=num_workers > 0,
@@ -1452,15 +1483,9 @@ def build_detection_dataloaders(
                                 y2 = float(bbox.find("ymax").text)
                             except Exception:
                                 continue
-                            if orig_w > 0 and orig_h > 0:
-                                scale_x = image_size / orig_w
-                                scale_y = image_size / orig_h
-                                boxes.append([
-                                    (x1 * scale_x) / image_size,
-                                    (y1 * scale_y) / image_size,
-                                    (x2 * scale_x) / image_size,
-                                    (y2 * scale_y) / image_size,
-                                ])
+                            converted = _convert_box_coords(x1, y1, x2, y2, orig_w=orig_w, orig_h=orig_h)
+                            if converted is not None:
+                                boxes.append(converted)
                                 labels.append(int(label))
 
                     if boxes:
@@ -1520,7 +1545,7 @@ def build_detection_dataloaders(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=use_pin_memory,
         collate_fn=_collate_detection_batch,  # Custom collate for detection
         prefetch_factor=2 if num_workers > 0 else None,  # Prefetch batches for faster GPU utilization
         persistent_workers=num_workers > 0,  # Keep workers alive between epochs
@@ -1530,7 +1555,7 @@ def build_detection_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=use_pin_memory,
         collate_fn=_collate_detection_batch,
         prefetch_factor=2 if num_workers > 0 else None,
         persistent_workers=num_workers > 0,
@@ -1633,5 +1658,3 @@ def _collate_detection_batch(batch: list) -> Tuple["torch.Tensor", list]:  # typ
     if same_size:
         images = torch.stack(images)
     return images, targets
-
-
