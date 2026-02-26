@@ -505,11 +505,12 @@ def build_rcnn_classic_model(
     if torch is None:
         raise RuntimeError("PyTorch is required")
 
-    image_size = int(config.hyperparameters.get("image_size", 224))
+    image_size = int(config.hyperparameters.get("image_size", 224)) #Here
     backbone_image_size = int(config.hyperparameters.get("backbone_image_size", image_size))
     projection_dim = int(config.hyperparameters.get("projection_dim", 128))
     projection_hidden_dim = config.hyperparameters.get("projection_hidden_dim")
     projection_use_bn = bool(config.hyperparameters.get("projection_use_bn", False))
+    adapt_small_models = bool(config.hyperparameters.get("adapt_small_models", True))
 
     if checkpoint_path is not None:
         ckpt = Path(checkpoint_path)
@@ -523,6 +524,7 @@ def build_rcnn_classic_model(
             projection_dim=projection_dim,
             projection_hidden_dim=projection_hidden_dim,
             projection_use_bn=projection_use_bn,
+            adapt_small_models=adapt_small_models,
         )
     else:
         full_model = build_model(
@@ -532,6 +534,7 @@ def build_rcnn_classic_model(
             projection_dim=projection_dim,
             projection_hidden_dim=projection_hidden_dim,
             projection_use_bn=projection_use_bn,
+            adapt_small_models=adapt_small_models,
         )
         backbone = full_model.backbone if hasattr(full_model, "backbone") else full_model
 

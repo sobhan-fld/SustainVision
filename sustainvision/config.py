@@ -156,6 +156,7 @@ class TrainingConfig:
             "lars_exclude_bias_n_norm": True,
             "projection_hidden_dim": None,
             "projection_use_bn": False,
+            "adapt_small_models": True,
             "use_gaussian_blur": False,
             "simclr_reference_transforms": False,
             "linear_subset_per_class": None,

@@ -219,6 +219,7 @@ def _evaluate_torchvision_frcnn(
                     config.hyperparameters.get("image_size", 224),
                 )
             )
+            adapt_small_models = bool(config.hyperparameters.get("adapt_small_models", True))
             det_models.maybe_load_backbone_weights(
                 checkpoint_path=checkpoint_path,
                 config_model_name=config.model,
@@ -227,6 +228,7 @@ def _evaluate_torchvision_frcnn(
                 projection_hidden_dim=config.hyperparameters.get("projection_hidden_dim"),
                 projection_use_bn=config.hyperparameters.get("projection_use_bn", False),
                 target_resnet_body=resnet_body_for_loading,
+                adapt_small_models=adapt_small_models,
             )
         except Exception as exc:
             print(f"[warn] Failed to load backbone weights: {exc}")

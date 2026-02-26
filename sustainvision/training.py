@@ -403,6 +403,7 @@ def _execute_training_phase(
         else None
     )
     projection_use_bn = bool(config.hyperparameters.get("projection_use_bn", False))
+    adapt_small_models = bool(config.hyperparameters.get("adapt_small_models", True))
     use_gaussian_blur = bool(config.hyperparameters.get("use_gaussian_blur", False))
     simclr_recipe = (
         bool(simclr_recipe_override)
@@ -472,6 +473,7 @@ def _execute_training_phase(
         projection_dim=projection_dim,
         projection_hidden_dim=projection_hidden_dim,
         projection_use_bn=projection_use_bn,
+        adapt_small_models=adapt_small_models,
     ).to(device)
 
     if initial_state is not None:

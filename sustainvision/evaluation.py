@@ -154,6 +154,7 @@ def evaluate_with_head(
             checkpoint_path = (base / checkpoint_path).resolve()
 
         print(f"[info] Loading pretrained backbone from: {checkpoint_path}")
+        adapt_small_models = bool(config.hyperparameters.get("adapt_small_models", True))
         backbone = det_models.load_pretrained_backbone(
             checkpoint_path,
             config.model,
@@ -161,6 +162,7 @@ def evaluate_with_head(
             projection_dim=config.hyperparameters.get("projection_dim", 128),
             projection_hidden_dim=config.hyperparameters.get("projection_hidden_dim"),
             projection_use_bn=config.hyperparameters.get("projection_use_bn", False),
+            adapt_small_models=adapt_small_models,
         )
     else:
         # Build model from scratch
@@ -169,6 +171,7 @@ def evaluate_with_head(
         set_seed(config.seed)
         
         # Build the full model (backbone + projection head) but we'll extract just the backbone
+        adapt_small_models = bool(config.hyperparameters.get("adapt_small_models", True))
         full_model = build_model(
             config.model,
             num_classes=10,  # Dummy, we'll extract backbone
@@ -176,6 +179,7 @@ def evaluate_with_head(
             projection_dim=config.hyperparameters.get("projection_dim", 128),
             projection_hidden_dim=config.hyperparameters.get("projection_hidden_dim"),
             projection_use_bn=config.hyperparameters.get("projection_use_bn", False),
+            adapt_small_models=adapt_small_models,
         )
         # Extract backbone (remove classifier/projector)
         backbone = full_model.backbone if hasattr(full_model, "backbone") else full_model

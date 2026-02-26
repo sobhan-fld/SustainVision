@@ -213,6 +213,7 @@ def load_pretrained_backbone(
     projection_dim: int = 128,
     projection_hidden_dim: Optional[int] = None,
     projection_use_bn: bool = False,
+    adapt_small_models: bool = True,
 ) -> "nn.Module":
     """Load a SustainVision checkpoint and return the backbone only."""
     if torch is None:
@@ -229,6 +230,7 @@ def load_pretrained_backbone(
         projection_dim=int(projection_dim),
         projection_hidden_dim=projection_hidden_dim,
         projection_use_bn=bool(projection_use_bn),
+        adapt_small_models=adapt_small_models,
     )
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -385,6 +387,7 @@ def maybe_load_backbone_weights(
     projection_hidden_dim: Optional[int],
     projection_use_bn: bool,
     target_resnet_body: "nn.Module",
+    adapt_small_models: bool = True,
 ) -> None:
     """Load SustainVision backbone weights into a torchvision ResNet body when provided."""
     if checkpoint_path is None:
@@ -397,6 +400,7 @@ def maybe_load_backbone_weights(
         projection_dim=projection_dim,
         projection_hidden_dim=projection_hidden_dim,
         projection_use_bn=projection_use_bn,
+        adapt_small_models=adapt_small_models,
     )
     missing, unexpected = target_resnet_body.load_state_dict(
         supcon_backbone.state_dict(),

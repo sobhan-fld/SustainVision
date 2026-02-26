@@ -170,6 +170,7 @@ def build_model(
     projection_dim: int,
     projection_hidden_dim: Optional[int] = None,
     projection_use_bn: bool = False,
+    adapt_small_models: bool = True,
 ) -> nn.Module:
     """Build a model from name, using torchvision backbones when available."""
     if nn is None:
@@ -235,7 +236,8 @@ def build_model(
             )
         if key == "mobilenet_v3_small":
             backbone = tv_models.mobilenet_v3_small(weights=None)
-            _adapt_mobilenet_for_small_images(backbone, image_size)
+            if adapt_small_models:
+                _adapt_mobilenet_for_small_images(backbone, image_size)
             feature_dim = backbone.classifier[-1].in_features
             backbone.classifier[-1] = nn.Identity()
             return ProjectionModel(
@@ -248,7 +250,8 @@ def build_model(
             )
         if key == "mobilenet_v3_large":
             backbone = tv_models.mobilenet_v3_large(weights=None)
-            _adapt_mobilenet_for_small_images(backbone, image_size)
+            if adapt_small_models:
+                _adapt_mobilenet_for_small_images(backbone, image_size)
             feature_dim = backbone.classifier[-1].in_features
             backbone.classifier[-1] = nn.Identity()
             return ProjectionModel(
@@ -261,7 +264,8 @@ def build_model(
             )
         if key == "efficientnet_b0":
             backbone = tv_models.efficientnet_b0(weights=None)
-            _adapt_efficientnet_for_small_images(backbone, image_size)
+            if adapt_small_models:
+                _adapt_efficientnet_for_small_images(backbone, image_size)
             feature_dim = backbone.classifier[-1].in_features
             backbone.classifier[-1] = nn.Identity()
             return ProjectionModel(

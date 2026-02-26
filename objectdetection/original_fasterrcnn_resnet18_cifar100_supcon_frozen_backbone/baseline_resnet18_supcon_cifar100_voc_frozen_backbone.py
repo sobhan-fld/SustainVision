@@ -276,6 +276,7 @@ def build_model(
         projection_dim=128,
         projection_hidden_dim=None,
         projection_use_bn=False,
+        adapt_small_models=True,
     )
 
     return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
