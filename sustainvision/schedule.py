@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import tempfile
 import time
+import copy
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -242,7 +243,19 @@ def _run_finetune_phase(
     else:
         # Use classification head (original behavior)
         print(f"[info] Starting finetune phase: {finetune_label} (backbone frozen, classification head)")
-    
+
+        # For the finetune phase, build a scheduler config that is tailored to
+        # the short linear-eval window. Reuse the main scheduler if present,
+        # but drop warmup so cosine annealing (or other schedulers) spans the
+        # finetune_epochs instead of collapsing into a single step.
+        finetune_scheduler_cfg: Optional[Dict[str, Any]] = None
+        base_scheduler = getattr(config, "scheduler", None)
+        if isinstance(base_scheduler, dict) and base_scheduler.get("type"):
+            finetune_scheduler_cfg = copy.deepcopy(base_scheduler)
+            scheduler_params = finetune_scheduler_cfg.get("params", {}) or {}
+            scheduler_params.pop("warmup_epochs", None)
+            finetune_scheduler_cfg["params"] = scheduler_params
+
     summary, state = _execute_training_phase(
         config,
         project_root=project_dir,
@@ -258,7 +271,7 @@ def _run_finetune_phase(
         freeze_backbone_override=params["freeze_backbone"],
         skip_emissions_tracker=False,
         reset_classifier=params["freeze_backbone"],  # Reset classifier to evaluate backbone quality
-        scheduler_config_override=None,
+        scheduler_config_override=finetune_scheduler_cfg,
         simclr_recipe_override=params["use_reference_transforms"],
         subset_per_class_override=params.get("linear_subset_per_class"),
         subset_seed_override=params.get("linear_subset_seed"),

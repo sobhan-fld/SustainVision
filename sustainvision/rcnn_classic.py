@@ -678,6 +678,8 @@ def _decode_predictions_for_batch(
     images: "torch.Tensor",
     score_threshold: float,
     nms_iou_threshold: float,
+    box_mode: str = "pred",
+    box_blend_weight_pred: float = 0.5,
 ) -> List[Dict[str, Any]]:
     if torch is None:
         raise RuntimeError("PyTorch is required")
@@ -686,6 +688,15 @@ def _decode_predictions_for_batch(
     pred_boxes_norm = outputs["pred_boxes_norm"]
     batch_indices = outputs["roi_batch_indices"]
     proposal_counts = outputs["proposal_counts"]
+    proposal_boxes_all = outputs.get("proposal_boxes")
+    mode = str(box_mode or "pred").strip().lower()
+    if mode not in {"pred", "proposal", "proposal_only", "blend"}:
+        mode = "pred"
+    try:
+        blend_w = float(box_blend_weight_pred)
+    except Exception:
+        blend_w = 0.5
+    blend_w = max(0.0, min(1.0, blend_w))
 
     probs = torch.softmax(logits, dim=1) if logits.numel() > 0 else logits.new_zeros((0, 1))
     scores, labels_internal = probs.max(dim=1) if logits.numel() > 0 else (
@@ -703,6 +714,7 @@ def _decode_predictions_for_batch(
         labels_i = labels_internal[mask]
         scores_i = scores[mask]
         boxes_norm_i = pred_boxes_norm[mask]
+        proposal_boxes_i = proposal_boxes_all[mask] if isinstance(proposal_boxes_all, torch.Tensor) else None
 
         # Drop background (class 0).
         keep = (labels_i > 0) & (scores_i >= float(score_threshold))
@@ -713,10 +725,11 @@ def _decode_predictions_for_batch(
         labels_i = labels_i[keep] - 1  # back to contiguous [0..C-1]
         scores_i = scores_i[keep]
         boxes_norm_i = boxes_norm_i[keep]
+        proposal_boxes_i = proposal_boxes_i[keep] if proposal_boxes_i is not None else None
 
         h = int(images[img_idx].shape[1])
         w = int(images[img_idx].shape[2])
-        boxes_xyxy = torch.stack(
+        pred_boxes_xyxy = torch.stack(
             [
                 boxes_norm_i[:, 0] * w,
                 boxes_norm_i[:, 1] * h,
@@ -725,6 +738,16 @@ def _decode_predictions_for_batch(
             ],
             dim=1,
         )
+        pred_boxes_xyxy = _clamp_boxes_xyxy(pred_boxes_xyxy, h, w)
+
+        if mode in {"proposal", "proposal_only"} and proposal_boxes_i is not None:
+            boxes_xyxy = proposal_boxes_i.to(pred_boxes_xyxy.dtype)
+        elif mode == "blend" and proposal_boxes_i is not None:
+            prop_boxes_xyxy = proposal_boxes_i.to(pred_boxes_xyxy.dtype)
+            boxes_xyxy = blend_w * pred_boxes_xyxy + (1.0 - blend_w) * prop_boxes_xyxy
+        else:
+            boxes_xyxy = pred_boxes_xyxy
+
         boxes_xyxy = _clamp_boxes_xyxy(boxes_xyxy, h, w)
         boxes_xyxy, scores_i, labels_i = apply_nms(
             boxes_xyxy, scores_i, labels_i, iou_threshold=float(nms_iou_threshold)
@@ -906,6 +929,14 @@ def evaluate_rcnn_classic(
     jitter_per_gt = int(eval_cfg.get("rcnn_classic_jitter_per_gt", 2))
     score_threshold = float(config.hyperparameters.get("score_threshold", 0.05))
     nms_iou_threshold = float(eval_cfg.get("nms_threshold", config.hyperparameters.get("nms_iou_threshold", 0.5)))
+    prediction_box_mode = str(eval_cfg.get("rcnn_classic_prediction_box_mode", "pred")).strip().lower()
+    prediction_box_blend_weight_pred = float(eval_cfg.get("rcnn_classic_prediction_box_blend_weight_pred", 0.5))
+    if prediction_box_mode not in {"pred", "proposal", "proposal_only", "blend"}:
+        print(
+            f"[warn] Unsupported rcnn_classic_prediction_box_mode={prediction_box_mode!r}; "
+            "falling back to 'pred'."
+        )
+        prediction_box_mode = "pred"
 
     best_val_loss = float("inf")
     best_epoch = 0
@@ -1095,6 +1126,8 @@ def evaluate_rcnn_classic(
                     images=images,
                     score_threshold=score_threshold,
                     nms_iou_threshold=nms_iou_threshold,
+                    box_mode=prediction_box_mode,
+                    box_blend_weight_pred=prediction_box_blend_weight_pred,
                 )
 
                 for local_idx, (pred, tgt, img) in enumerate(zip(batch_preds, targets, images)):
@@ -1199,6 +1232,8 @@ def evaluate_rcnn_classic(
         "energy_kwh": float(energy_kwh_total) if energy_kwh_total is not None else None,
         "proposal_method": proposal_method,
         "proposal_cache_dir": str(proposal_cache_dir) if proposal_cache_dir is not None else None,
+        "prediction_box_mode": prediction_box_mode,
+        "prediction_box_blend_weight_pred": prediction_box_blend_weight_pred,
         "started_at": run_started_at.isoformat(),
         "finished_at": finished_at_iso,
         "note": "Experimental classic R-CNN style pipeline using proposals + ROI crops.",
@@ -1285,6 +1320,8 @@ def evaluate_rcnn_classic(
                     "duration_seconds",
                     "proposal_method",
                     "proposal_cache_dir",
+                    "prediction_box_mode",
+                    "prediction_box_blend_weight_pred",
                     "started_at",
                     "finished_at",
                     "finished_at_local",
@@ -1305,6 +1342,8 @@ def evaluate_rcnn_classic(
                             "duration_seconds": "",
                             "proposal_method": proposal_method,
                             "proposal_cache_dir": str(proposal_cache_dir) if proposal_cache_dir is not None else "",
+                            "prediction_box_mode": prediction_box_mode,
+                            "prediction_box_blend_weight_pred": prediction_box_blend_weight_pred,
                             "started_at": "",
                             "finished_at": "",
                             "finished_at_local": "",
@@ -1326,6 +1365,8 @@ def evaluate_rcnn_classic(
                         "duration_seconds": results.get("duration_seconds", ""),
                         "proposal_method": proposal_method,
                         "proposal_cache_dir": str(proposal_cache_dir) if proposal_cache_dir is not None else "",
+                        "prediction_box_mode": prediction_box_mode,
+                        "prediction_box_blend_weight_pred": prediction_box_blend_weight_pred,
                         "started_at": results.get("started_at", ""),
                         "finished_at": results.get("finished_at", ""),
                         "finished_at_local": finished_at_local,
